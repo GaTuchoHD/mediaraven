@@ -161,3 +161,11 @@ def test_build_reddit_caption_full_not_truncated():
     assert "..." in short
     assert len(full) > 5000
     assert "..." not in full[:5000]
+
+
+def test_build_reddit_caption_titulo_longo_vai_inteiro():
+    titulo = "T" * 299 + "Z"
+    short, full = build_reddit_caption(titulo, "corpo " * 400, "https://www.reddit.com/r/x/comments/abc/y/")
+    assert titulo in short
+    assert len(short) <= 1024
+    assert titulo in full

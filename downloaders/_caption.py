@@ -61,7 +61,9 @@ def _build_caption(info_dict: dict[str, Any], url: str) -> tuple[str, str]:
     elif _title_is_redundant(raw_title, raw_desc):
         raw_title = ''
 
-    if not raw_uploader and raw_title:
+    # Sem autor (post do Reddit), o título sobe pro cabeçalho — e continua inteiro.
+    title_in_header = not raw_uploader and bool(raw_title)
+    if title_in_header:
         raw_uploader, raw_title = raw_title, ''
 
     link_label = msg("caption.link_original_label")
@@ -93,19 +95,16 @@ def _build_caption(info_dict: dict[str, Any], url: str) -> tuple[str, str]:
     short = ""
     if has_content:
         caption_budget = max(200, CAPTION_MAX - FRAGMENT_RESERVE - len(url))
-        up_b = min(80, caption_budget // 5)
-        ttl_b = min(120, caption_budget // 4)
-        ds_b = caption_budget - up_b - ttl_b
 
-        up_t = raw_uploader[:up_b]
-        if len(raw_uploader) > up_b:
-            up_t = up_t.rstrip() + "..."
-        ttl_t = raw_title[:ttl_b]
-        if len(raw_title) > ttl_b:
-            ttl_t = ttl_t.rstrip() + "..."
-        ds_t = raw_desc[:ds_b]
-        if len(raw_desc) > ds_b:
-            ds_t = ds_t.rstrip() + "..."
+        def _cut(text: str, limit: int) -> str:
+            return text if len(text) <= limit else text[:max(0, limit)].rstrip() + "..."
+
+        up_t = _cut(raw_uploader, caption_budget if title_in_header else min(80, caption_budget // 5))
+        # Título vai inteiro (no Reddit chega a 300 chars): quem cede espaço é a
+        # descrição, que sai completa no texto à parte quando não cabe aqui.
+        ttl_t = _cut(raw_title, caption_budget - len(up_t))
+        ds_b = caption_budget - len(up_t) - len(ttl_t)
+        ds_t = _cut(raw_desc, ds_b) if ds_b > 3 else ""
 
         short = _assemble(up_t, ttl_t, ds_t)
         if len(short) > CAPTION_MAX:
