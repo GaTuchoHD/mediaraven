@@ -1521,6 +1521,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#v132-post-titles-always-whole" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v1.3.2 — Post titles always whole
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v131-ignored-download-becomes-a-reaction-no-message" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1995,6 +2006,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#v132-post-titles-always-whole" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v1.3.2 — Post titles always whole
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v131-ignored-download-becomes-a-reaction-no-message" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2455,6 +2477,12 @@
 
 
 <h1 id="changelog">Changelog<a class="headerlink" href="#changelog" title="Permanent link">&para;</a></h1>
+<h2 id="v132-post-titles-always-whole">v1.3.2 — Post titles always whole<a class="headerlink" href="#v132-post-titles-always-whole" title="Permanent link">&para;</a></h2>
+<p><strong>Root cause:</strong> in the caption attached to the media, the title was cut with <code>...</code> — at <strong>80 characters</strong> on Reddit (with no author, the title moves to the header and inherited the author-name limit) and at 120 elsewhere. Reddit titles go up to 300.</p>
+<ul>
+<li>📝 <strong>The title is never cut:</strong> the description gives up space in the short caption instead, and still goes out whole in the separate text when it doesn't fit.</li>
+<li>✅ 425 tests (new: a 300-char Reddit title comes out whole and the caption stays ≤ 1024).</li>
+</ul>
 <h2 id="v131-ignored-download-becomes-a-reaction-no-message">v1.3.1 — Ignored download becomes a 🙈 reaction, no message<a class="headerlink" href="#v131-ignored-download-becomes-a-reaction-no-message" title="Permanent link">&para;</a></h2>
 <ul>
 <li>🙈 <strong>Ignoring the download no longer sends text:</strong> with a single link, the prompt disappears and the original message's reaction switches to <code>reaction_ignored</code> (default 🙈 — Telegram only accepts a fixed emoji list as bot reactions, no ❌). With several links in the same message, or if the chat refuses the reaction, the <code>status.download_ignored</code> text is kept.</li>
@@ -2978,7 +3006,7 @@
     <span class="md-icon" title="Last update">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-timeago" title="October 9, 2026 14:20:27 UTC"><span class="timeago" datetime="2026-10-09T14:20:27+00:00" locale="en"></span></span><span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-iso_date" title="October 9, 2026 14:20:27 UTC">2026-10-09</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-timeago" title="October 11, 2026 19:35:42 UTC"><span class="timeago" datetime="2026-10-11T19:35:42+00:00" locale="en"></span></span><span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-iso_date" title="October 11, 2026 19:35:42 UTC">2026-10-11</span>
   </span>
 
     

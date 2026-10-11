@@ -1519,6 +1519,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#v132-titulo-das-postagens-sempre-inteiro" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v1.3.2 — Título das postagens sempre inteiro
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v131-download-ignorado-vira-reacao-sem-mensagem" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1993,6 +2004,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#v132-titulo-das-postagens-sempre-inteiro" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v1.3.2 — Título das postagens sempre inteiro
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v131-download-ignorado-vira-reacao-sem-mensagem" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2453,6 +2475,12 @@
 
 
 <h1 id="changelog">Changelog<a class="headerlink" href="#changelog" title="Permanent link">&para;</a></h1>
+<h2 id="v132-titulo-das-postagens-sempre-inteiro">v1.3.2 — Título das postagens sempre inteiro<a class="headerlink" href="#v132-titulo-das-postagens-sempre-inteiro" title="Permanent link">&para;</a></h2>
+<p><strong>Causa:</strong> na legenda que vai junto da mídia, o título era cortado com <code>...</code> — em <strong>80 caracteres</strong> no Reddit (sem autor, o título sobe pro cabeçalho e herdava o limite do nome do autor) e em 120 nos demais. Título do Reddit chega a 300.</p>
+<ul>
+<li>📝 <strong>O título nunca é cortado:</strong> quem cede espaço na legenda curta é a descrição, que continua saindo completa no texto à parte quando não cabe.</li>
+<li>✅ 425 testes (novo: título de 300 caracteres do Reddit sai inteiro e a legenda fica ≤ 1024).</li>
+</ul>
 <h2 id="v131-download-ignorado-vira-reacao-sem-mensagem">v1.3.1 — Download ignorado vira reação 🙈, sem mensagem<a class="headerlink" href="#v131-download-ignorado-vira-reacao-sem-mensagem" title="Permanent link">&para;</a></h2>
 <ul>
 <li>🙈 <strong>Ignorar o download não manda mais texto:</strong> com link único, a pergunta some e a reação da mensagem original troca para <code>reaction_ignored</code> (default 🙈 — o Telegram só aceita uma lista fixa de emojis como reação de bot, sem ❌). Com vários links na mesma mensagem, ou se o chat recusar a reação, continua o texto <code>status.download_ignored</code>.</li>
@@ -2976,7 +3004,7 @@
     <span class="md-icon" title="Última atualização">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-timeago" title="9 de outubro de 2026 14:20:27 UTC"><span class="timeago" datetime="2026-10-09T14:20:27+00:00" locale="pt"></span></span><span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-iso_date" title="9 de outubro de 2026 14:20:27 UTC">2026-10-09</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-timeago" title="11 de outubro de 2026 19:35:42 UTC"><span class="timeago" datetime="2026-10-11T19:35:42+00:00" locale="pt"></span></span><span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-iso_date" title="11 de outubro de 2026 19:35:42 UTC">2026-10-11</span>
   </span>
 
     
