@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.3.2 — Post titles always whole
+
+**Root cause:** in the caption attached to the media, the title was cut with `...` — at **80 characters** on Reddit (with no author, the title moves to the header and inherited the author-name limit) and at 120 elsewhere. Reddit titles go up to 300.
+
+- 📝 **The title is never cut:** the description gives up space in the short caption instead, and still goes out whole in the separate text when it doesn't fit.
+- ✅ 425 tests (new: a 300-char Reddit title comes out whole and the caption stays ≤ 1024).
+
 ## v1.3.1 — Ignored download becomes a 🙈 reaction, no message
 
 - 🙈 **Ignoring the download no longer sends text:** with a single link, the prompt disappears and the original message's reaction switches to `reaction_ignored` (default 🙈 — Telegram only accepts a fixed emoji list as bot reactions, no ❌). With several links in the same message, or if the chat refuses the reaction, the `status.download_ignored` text is kept.

@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.3.2 — Título das postagens sempre inteiro
+
+**Causa:** na legenda que vai junto da mídia, o título era cortado com `...` — em **80 caracteres** no Reddit (sem autor, o título sobe pro cabeçalho e herdava o limite do nome do autor) e em 120 nos demais. Título do Reddit chega a 300.
+
+- 📝 **O título nunca é cortado:** quem cede espaço na legenda curta é a descrição, que continua saindo completa no texto à parte quando não cabe.
+- ✅ 425 testes (novo: título de 300 caracteres do Reddit sai inteiro e a legenda fica ≤ 1024).
+
 ## v1.3.1 — Download ignorado vira reação 🙈, sem mensagem
 
 - 🙈 **Ignorar o download não manda mais texto:** com link único, a pergunta some e a reação da mensagem original troca para `reaction_ignored` (default 🙈 — o Telegram só aceita uma lista fixa de emojis como reação de bot, sem ❌). Com vários links na mesma mensagem, ou se o chat recusar a reação, continua o texto `status.download_ignored`.
