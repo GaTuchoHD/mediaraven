@@ -124,7 +124,8 @@
     "post_v_deo": "👽 Post is video — delegating to yt-dlp (which handles DASH merge).",
     "crosspost_detectado": "🔁 Crosspost detected — extracting media from the original post.",
     "erro_ao_ler": "⚠️ Error reading Reddit JSON (aiohttp): {e}",
-    "erro_ao_processar": "⚠️ Error processing Reddit image: {e}"
+    "erro_ao_processar": "⚠️ Error processing Reddit image: {e}",
+    "usando_pagina_html": "📄 Reddit JSON API blocked — reading the post page."
   },
   "reddit_playwright": {
     "iniciando_extra_o_via": "👽 Starting Playwright extraction for Reddit: {arg0}",

@@ -1,7 +1,12 @@
+import asyncio
+import html
 import logging
 import os
+import re
+from urllib.parse import urljoin
 
 import aiohttp
+from curl_cffi import requests as curl_requests
 
 import state
 from config import cfg
@@ -9,12 +14,23 @@ from cookies import get_aiohttp_cookies_for_url
 from messages import lmsg, msg
 from utils import async_download_file, normalize_image, safe_url
 
-from .reddit_common import build_reddit_caption, clean_reddit_media_url, looks_like_image, reddit_external_link
+from .reddit_common import (
+    build_reddit_caption, clean_reddit_media_url, is_reddit_media_url, looks_like_image, reddit_external_link,
+)
 
 logger = logging.getLogger(__name__)
 
 _REDDIT_GUEST_BOOTSTRAP_URL = "https://old.reddit.com/"
 _reddit_session_ready = False
+
+# Desafio JS do Reddit (out/2026): o script só dobra a semente e reenvia o form via GET.
+_JSC_SEED_RE = re.compile(r'\(async e=>e\+e\)\("([0-9a-f]+)"\)')
+_JSC_ACTION_RE = re.compile(r'<form[^>]*action="([^"]+)"')
+_JSC_INPUT_RE = re.compile(r'<input type="hidden" name="(\w+)"(?: value="([^"]*)")?')
+_POST_RE = re.compile(r'<shreddit-post\b([^>]*)>(.*?)</shreddit-post>', re.S)
+_ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
+_PLAYER_RE = re.compile(r'<shreddit-player\b[^>]*\bsrc="([^"]+)"')
+_IREDDIT_RE = re.compile(r'https://i\.redd\.it/[^"?&\s]+')
 
 
 def _reddit_json_headers() -> dict:
@@ -64,10 +80,63 @@ async def _fetch_reddit_post_data(url: str) -> dict:
     try:
         return await _get()
     except aiohttp.ClientResponseError as e:
-        if e.status in (403, 429):
-            await _ensure_reddit_session(force=True)
-            return await _get()
-        raise
+        if e.status not in (403, 429):
+            raise
+        await _ensure_reddit_session(force=True)
+    try:
+        return await _get()
+    except aiohttp.ClientResponseError as e:
+        if e.status != 403:
+            raise
+    # Desde out/2026 a API JSON dá 403 pra anônimo; a página do post ainda abre.
+    logger.info(lmsg("reddit_json.usando_pagina_html"))
+    return _post_data_from_html(await _fetch_reddit_page(clean_url + '/'))
+
+
+def _fetch_reddit_page_sync(url: str) -> str:
+    # aiohttp leva 403 mesmo resolvendo o desafio; precisa da digital TLS de navegador.
+    with curl_requests.Session(impersonate="firefox", timeout=15) as s:
+        r = s.get(url)
+        seed = _JSC_SEED_RE.search(r.text)
+        if seed:
+            fields = {k: html.unescape(v) for k, v in _JSC_INPUT_RE.findall(r.text)}
+            fields['solution'] = seed.group(1) * 2
+            action = _JSC_ACTION_RE.search(r.text)
+            r = s.get(urljoin(url, html.unescape(action.group(1))) if action else url, params=fields)
+        r.raise_for_status()
+        return r.text
+
+
+async def _fetch_reddit_page(url: str) -> str:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(state.IO_POOL, _fetch_reddit_page_sync, url)
+
+
+def _post_data_from_html(page: str) -> dict:
+    """Monta, a partir do <shreddit-post>, um dict com os campos do JSON que o
+    resto do fluxo usa. `_media_urls` traz as imagens (i.redd.it) na ordem e
+    `_hls_url` o stream do vídeo, que o dispatcher entrega pro yt-dlp."""
+    m = _POST_RE.search(page)
+    if not m:
+        raise ValueError("shreddit-post não encontrado na página do Reddit")
+    attrs = {k: html.unescape(v) for k, v in _ATTR_RE.findall(m.group(1))}
+    body = m.group(2)
+    post_type = attrs.get('post-type', '')
+    data = {
+        'title': attrs.get('post-title', ''),
+        'selftext': '',
+        'url': attrs.get('content-href', ''),
+        'domain': attrs.get('domain', ''),
+        'is_self': post_type == 'text',
+        'is_video': post_type == 'video',
+    }
+    player = _PLAYER_RE.search(body)
+    if player:
+        data['_hls_url'] = html.unescape(player.group(1))
+    if post_type in ('image', 'gallery'):
+        urls = [u for u in _IREDDIT_RE.findall(body) if is_reddit_media_url(u)]
+        data['_media_urls'] = list(dict.fromkeys(urls)) or [data['url']]
+    return data
 
 
 async def resolve_reddit_external_link(url: str) -> tuple["dict | None", "dict | None"]:
@@ -112,7 +181,10 @@ async def download_reddit_json(
             logger.info(lmsg("reddit_json.post_v_deo"))
             return [], msg("downloader_status.reddit_json_fail"), "", ""
 
-        if 'media_metadata' in media_src:
+        if media_src.get('_media_urls'):
+            media_urls = [u for u in map(clean_reddit_media_url, media_src['_media_urls']) if u]
+
+        elif 'media_metadata' in media_src:
             metadata = media_src['media_metadata']
             gallery_items = media_src.get('gallery_data', {}).get('items', [])
             if gallery_items:

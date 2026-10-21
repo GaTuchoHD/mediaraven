@@ -249,3 +249,64 @@ async def test_reddit_json_handles_malformed(tmp_path):
     files, status, _short, _full = await reddit_json.download_reddit_json("https://reddit.com/r/x/comments/z/", folder)
     assert files == []
     assert status
+
+
+def test_post_data_from_html_gallery_e_video():
+    """Página do shreddit (API JSON bloqueada): galeria em ordem, sem junk; vídeo traz o HLS do post."""
+    gallery = (
+        '<shreddit-post post-type="gallery" post-title="Tit &#39;x&#39;" '
+        'content-href="https://www.reddit.com/gallery/abc" domain="reddit.com">'
+        '<img src="https://i.redd.it/um.jpeg"><img data-lazy-src="https://preview.redd.it/x-v0-um.jpeg?width=640">'
+        '<img src="https://i.redd.it/dois.png"><img src="https://i.redd.it/um.jpeg">'
+        '<img src="https://i.redd.it/snoovatar/avatars/a.png"></shreddit-post>'
+        '<img src="https://i.redd.it/fora_do_post.png">'
+    )
+    d = reddit_json._post_data_from_html(gallery)
+    assert d['title'] == "Tit 'x'"
+    assert d['_media_urls'] == ['https://i.redd.it/um.jpeg', 'https://i.redd.it/dois.png']
+    assert reddit_json.reddit_external_link(d) is None
+
+    video = (
+        '<shreddit-post post-type="video" post-title="V" content-href="https://v.redd.it/abc" domain="v.redd.it">'
+        '<shreddit-player src="https://v.redd.it/abc/HLSPlaylist.m3u8?f=sd&amp;a=1"></shreddit-post>'
+        '<shreddit-player src="https://v.redd.it/anuncio/HLSPlaylist.m3u8">'
+    )
+    d = reddit_json._post_data_from_html(video)
+    assert d['is_video'] and d['_hls_url'] == 'https://v.redd.it/abc/HLSPlaylist.m3u8?f=sd&a=1'
+    assert '_media_urls' not in d
+
+
+def test_fetch_reddit_page_resolve_desafio_js():
+    desafio = (
+        '<form hidden method="GET" action="/r/x/comments/z/t/"><input type="hidden" name="solution" />'
+        '<input type="hidden" name="js_challenge" value="1"/><input type="hidden" name="jsc_token" value="tok"/>'
+        '</form><script>await(async e=>e+e)("ab12")</script>'
+    )
+    calls = []
+
+    class _Resp:
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            pass
+
+    class _Session:
+        def __init__(self, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def get(self, url, params=None):
+            calls.append((url, params))
+            return _Resp(desafio if params is None else "<shreddit-post></shreddit-post>")
+
+    with patch.object(reddit_json.curl_requests, 'Session', _Session):
+        page = reddit_json._fetch_reddit_page_sync("https://www.reddit.com/r/x/comments/z/t/")
+    assert page == "<shreddit-post></shreddit-post>"
+    assert calls[1] == ("https://www.reddit.com/r/x/comments/z/t/",
+                        {'solution': 'ab12ab12', 'js_challenge': '1', 'jsc_token': 'tok'})

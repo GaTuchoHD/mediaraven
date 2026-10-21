@@ -183,6 +183,7 @@ async def download_media(
             if embed_files:
                 return await _finalize_success(embed_files, embed_status, embed_short, embed_full, url, platform_label, started)
 
+        reddit_post_data = None
         if platform.reddit:
             link, reddit_post_data = await resolve_reddit_external_link(url)
             if link and link.get('external_url') and _depth < 2:
@@ -222,12 +223,17 @@ async def download_media(
                 metrics.record_multilang(platform_label)
                 return lang_buttons, "MULTILANG", "", "", False
 
+        # Reddit sem API JSON: o yt-dlp baixa direto o HLS achado na página.
+        hls_url = (reddit_post_data or {}).get('_hls_url')
         downloaded_files, info_dict, unrecoverable_reason = await _run_ytdlp_with_cookie_fallback(
-            base_opts, url, unique_folder, has_firefox_cookie, target_lang,
+            base_opts, hls_url or url, unique_folder, has_firefox_cookie, target_lang,
             platform=platform,
         )
 
-        caption_short, caption_full = _build_caption(info_dict, url)
+        if hls_url:
+            caption_short, caption_full = _build_caption({'title': reddit_post_data.get('title') or ''}, url)
+        else:
+            caption_short, caption_full = _build_caption(info_dict, url)
 
         if downloaded_files and platform.facebook and facebook_owner_mismatch(url, info_dict):
             logger.warning(lmsg(
