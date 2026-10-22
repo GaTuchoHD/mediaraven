@@ -24,7 +24,7 @@ async def test_cookies_status_command_reports_missing_database(monkeypatch):
         effective_user=SimpleNamespace(id=123),
         message=message,
     )
-    monkeypatch.setattr(handlers, "ALLOW_ALL", True)
+    monkeypatch.setattr(handlers, "ADMIN_USER_ID", [123])
     monkeypatch.setattr(state, "FIREFOX_COOKIES_CACHE", [])
     monkeypatch.setattr(cookies, "get_firefox_cookie_status", lambda: {
         'path': '/safe/cookies/firefox/cookies.sqlite',
@@ -48,7 +48,7 @@ async def test_cookies_status_command_never_includes_cookie_values(monkeypatch):
         effective_user=SimpleNamespace(id=123),
         message=message,
     )
-    monkeypatch.setattr(handlers, "ALLOW_ALL", True)
+    monkeypatch.setattr(handlers, "ADMIN_USER_ID", [123])
     monkeypatch.setattr(state, "FIREFOX_COOKIES_CACHE", [{}])
     monkeypatch.setattr(cookies, "get_firefox_cookie_status", lambda: {
         'path': '/safe/cookies/firefox/cookies.sqlite',
@@ -133,7 +133,7 @@ async def test_cookies_add_instagram_reauthenticates_active_client(monkeypatch):
         bot=bot,
     )
     reauthenticate = AsyncMock(return_value=True)
-    monkeypatch.setattr(handlers, "ALLOW_ALL", True)
+    monkeypatch.setattr(handlers, "ADMIN_USER_ID", [123])
     monkeypatch.setattr(state, "PW_CONTEXT", None)
     monkeypatch.setattr(
         cookies,

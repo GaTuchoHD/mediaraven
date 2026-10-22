@@ -1,4 +1,3 @@
-import tempfile
 from media_cache import cleanup_and_vacuum_cache
 import asyncio
 import logging
@@ -43,26 +42,8 @@ def _clean_old_temp_folders():
         except Exception as e:
             logger.error(f"Erro na limpeza automatica de BASE_DOWNLOAD_DIR: {e}")
 
-    # 2. Clean /tmp temporary test files older than 1 hour
-    tmp_dir = tempfile.gettempdir()
-    if os.path.exists(tmp_dir):
-        try:
-            for item in os.listdir(tmp_dir):
-                if item.startswith(("test_", "frieren_", "debug_")):
-                    item_path = os.path.join(tmp_dir, item)
-                    mtime = os.path.getmtime(item_path)
-                    if (now - mtime) > 3600:
-                        try:
-                            if os.path.isdir(item_path):
-                                shutil.rmtree(item_path, ignore_errors=True)
-                            else:
-                                os.remove(item_path)
-                            cleaned_count += 1
-                        except Exception:
-                            pass
-        except Exception:
-            pass
-
+    # Only managed paths under BASE_DOWNLOAD_DIR belong to this application.
+    # Never delete generic /tmp files owned by other processes.
     cleanup_and_vacuum_cache()
     if cleaned_count > 0:
         mb_freed = total_freed_bytes / (1024 * 1024)

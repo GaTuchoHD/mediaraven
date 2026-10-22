@@ -279,6 +279,7 @@ async def test_media_group_converts_webm_video(tmp_path):
             "VIDEO_CONVERT_TIMEOUT": 600,
             "MEDIA_GROUP_CHUNK_SIZE": 10,
             "MEDIA_GROUP_DELAY": 0,
+            "TELEGRAM_MAX_UPLOAD_MB": 2000,
         }[key]
 
     with patch.object(telegram_io, "cfg", fake_cfg), \
@@ -311,6 +312,7 @@ async def test_media_group_passes_paths_and_timeouts(tmp_path):
             "TELEGRAM_UPLOAD_TIMEOUT": 600,
             "MEDIA_GROUP_CHUNK_SIZE": 10,
             "MEDIA_GROUP_DELAY": 0,
+            "TELEGRAM_MAX_UPLOAD_MB": 2000,
         }[key]
 
     with patch.object(telegram_io, "cfg", fake_cfg):

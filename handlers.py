@@ -7,6 +7,7 @@ import random
 import time
 import uuid
 from typing import Any, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, Forbidden
@@ -18,6 +19,8 @@ from config import (
     ALLOW_ALL,
     ALLOWED_CHAT_ID,
     ALLOWED_USER_ID,
+    ADMIN_USER_ID,
+    MAX_QUEUE_WAIT_SECONDS,
     ALLOWED_USERNAMES,
     BASE_DOWNLOAD_DIR,
     request_context,
@@ -40,6 +43,16 @@ from telegram_io import (
 from utils import chunk_html_text, cycle_status_message, is_ignored_domain, safe_cleanup, safe_url
 
 logger = logging.getLogger(__name__)
+
+
+def _cache_key_for_language(url: str, target_lang: Optional[str]) -> str:
+    """Keep audio-language variants separate in the Telegram file-id cache."""
+    if not target_lang:
+        return url
+    parsed = urlsplit(url)
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    query.append(("__mediaraven_language", target_lang))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
 
 def _cached_caption_payload(cached: dict[str, Any]) -> tuple[Optional[str], str]:
@@ -545,7 +558,8 @@ async def process_media_request(
         lock = await _acquire_chat_lock(status_msg, chat_id, suffix)
         lock_acquired = True
 
-        cached = await asyncio.to_thread(get_cached_media, url)
+        cache_key = _cache_key_for_language(url, target_lang)
+        cached = await asyncio.to_thread(get_cached_media, cache_key)
         if cached and len(cached.get("file_ids") or []) == 1:
             await _safe_edit(status_msg, f"⚡ Enviando do cache...{suffix}")
             cached_caption, cached_text = _cached_caption_payload(cached)
@@ -566,7 +580,7 @@ async def process_media_request(
                 logger.info("⚡ Mídia entregue pelo cache Telegram.")
                 await _safe_delete(status_msg)
                 return
-            await asyncio.to_thread(delete_cached_media, url)
+            await asyncio.to_thread(delete_cached_media, cache_key)
 
         await _safe_edit(status_msg, msg("status.downloading", suffix=suffix), parse_mode='HTML')
         status_task = asyncio.create_task(cycle_status_message(status_msg, suffix))
@@ -660,7 +674,7 @@ async def process_media_request(
 
         await _send_files_and_cleanup_status(
             context, chat_id, message_id, status_msg, files, desc_short, desc_full,
-            suffix, user_id, idx, is_article=is_article, cache_url=url,
+            suffix, user_id, idx, is_article=is_article, cache_url=cache_key,
             request_id=request_id,
         )
 
@@ -715,22 +729,30 @@ async def process_media_request(
             lock.release()
 
 
-async def _bounded_media_request(*args, **kwargs) -> None:
-    """Bound downloader concurrency and account for queued/active requests."""
+async def _bounded_media_request(*args, _reserved: bool = False, **kwargs) -> None:
+    """Bound active downloads, pending work, and time spent waiting for capacity."""
     started = False
-    state.request_queued()
+    acquired = False
+    if not _reserved and not state.try_request_queued():
+        logger.warning("Solicitação recusada: fila de downloads esgotada")
+        if len(args) >= 2:
+            await args[0].bot.send_message(args[1], "⚠️ Fila de downloads cheia. Tente novamente.")
+        return
     try:
-        async with state.REQUEST_SEMAPHORE:
-            state.request_started()
-            started = True
-            await process_media_request(*args, **kwargs)
-    except asyncio.CancelledError:
-        raise
+        await asyncio.wait_for(state.REQUEST_SEMAPHORE.acquire(), timeout=MAX_QUEUE_WAIT_SECONDS)
+        acquired = True
+        state.request_started()
+        started = True
+        await process_media_request(*args, **kwargs)
+    except asyncio.TimeoutError:
+        logger.warning("Solicitação expirou aguardando vaga na fila de downloads")
     except Exception:
         # This is a last-resort supervisor. process_media_request normally
         # handles delivery errors itself, but no task exception may go unseen.
         logger.exception("Falha não tratada no supervisor de download")
     finally:
+        if acquired:
+            state.REQUEST_SEMAPHORE.release()
         if started:
             state.request_finished()
         else:
@@ -813,6 +835,12 @@ def _is_allowed_user(update: Update) -> bool:
     )
 
 
+def _is_admin_update(update: Update) -> bool:
+    """Administrative privileges are never inherited from a group allowlist."""
+    user = getattr(update, "effective_user", None)
+    return bool(user and user.id in ADMIN_USER_ID)
+
+
 def _is_authorized_update(update: Update) -> bool:
     effective_chat = getattr(update, "effective_chat", None)
     chat_id = effective_chat.id if effective_chat else 0
@@ -860,12 +888,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     total_urls = len(safe_urls)
     for idx, url in enumerate(safe_urls, start=1):
-        task = asyncio.create_task(
-            _bounded_media_request(
-                context, chat_id, update.message.id, url,
-                user_id=user_id, idx=idx, total=total_urls,
+        if not state.try_request_queued():
+            await update.message.reply_text("⚠️ Fila de downloads cheia. Tente novamente.")
+            break
+        try:
+            task = asyncio.create_task(
+                _bounded_media_request(
+                    context, chat_id, update.message.id, url,
+                    user_id=user_id, idx=idx, total=total_urls, _reserved=True,
+                )
             )
-        )
+        except BaseException:
+            state.request_cancelled_while_pending()
+            raise
         state.background_tasks.add(task)
         task.add_done_callback(_media_task_done)
 
@@ -875,7 +910,7 @@ async def status_command_handler(update: Update, context: ContextTypes.DEFAULT_T
     user_id = update.effective_user.id if update.effective_user else 0
 
     # Check permissions
-    if not _is_authorized_update(update):
+    if not _is_admin_update(update):
         await update.message.reply_text("⛔ Comando restrito ao Administrador.")
         return
 
@@ -909,7 +944,7 @@ async def cookies_status_command_handler(update: Update, context: ContextTypes.D
     """Report Firefox cookie health without exposing names, values or tokens."""
     user_id = update.effective_user.id if update.effective_user else 0
 
-    if not _is_authorized_update(update):
+    if not _is_admin_update(update):
         await update.message.reply_text("⛔ Comando restrito ao Administrador.")
         return
 
@@ -1007,7 +1042,7 @@ async def whoami_command_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 async def cookies_add_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Install platform cookies from an authorized Telegram command."""
-    if not _is_authorized_update(update):
+    if not _is_admin_update(update):
         await update.message.reply_text("⛔ Comando restrito ao Administrador.")
         return
 
@@ -1127,16 +1162,16 @@ async def reset_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
     """Telegram Admin Restart Command (/reset or /restart)."""
     user_id = update.effective_user.id if update.effective_user else 0
 
-    if not _is_authorized_update(update):
+    if not _is_admin_update(update):
         await update.message.reply_text("⛔ Comando restrito ao Administrador.")
         return
 
     await update.message.reply_text("🔄 <b>Reiniciando o MediaRaven...</b>\nO bot estará online novamente em 3 segundos.", parse_mode="HTML")
     logger.info(f"🔄 Comando /reset acionado pelo Admin (User ID: {user_id}). Reiniciando processo...")
 
-    # Schedule clean process restart after 1 second
+    # Stop polling gracefully. The Docker restart policy handles process recreation.
     async def _do_restart():
         await asyncio.sleep(1)
-        os._exit(1)  # Docker restart policy will recreate the bot process.
+        context.application.stop_running()
 
     asyncio.create_task(_do_restart())

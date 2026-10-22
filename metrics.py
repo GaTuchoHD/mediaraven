@@ -1,4 +1,3 @@
-import asyncio
 from dataclasses import dataclass, field
 import logging
 import os
@@ -152,21 +151,11 @@ def _persist_platform(platform: str, stats: _PlatformStats) -> None:
 
 
 def _schedule_persist(platform: str, stats: _PlatformStats) -> None:
-    """Fire-and-forget SQLite write on a daemon thread in async loop, or inline when sync."""
-    s = _PlatformStats(
-        success=stats.success,
-        failure=stats.failure,
-        multilang=stats.multilang,
-        total_duration_s=stats.total_duration_s,
-        last_success_at=stats.last_success_at,
-        last_failure_at=stats.last_failure_at,
-    )
-    try:
-        asyncio.get_running_loop()
-        t = threading.Thread(target=_persist_platform, args=(platform, s), daemon=True)
-        t.start()
-    except RuntimeError:
-        _persist_platform(platform, s)
+    """Persist synchronously under _lock so older snapshots cannot win a race.
+
+    Callers already hold _lock. Pipeline callers run record_* via to_thread.
+    """
+    _persist_platform(platform, stats)
 
 
 def _bucket(platform: str) -> _PlatformStats:

@@ -73,6 +73,7 @@
     "instagrapi_fail": "⚠️ Falha ao baixar do Instagram.",
     "reddit_json": "👽 API Nativa (Imagens)",
     "reddit_json_fail": "⚠️ Falha ao extrair imagens do Reddit.",
+    "reddit_extraction_failed": "⚠️ Não foi possível extrair este post do Reddit com segurança; o conteúdo pode ter sido removido ou estar temporariamente indisponível ou restrito.",
     "reddit_unavailable": "⚠️ Conteúdo removido ou indisponível no Reddit. Não foi possível baixar a mídia deste post.",
     "reddit_playwright": "👽 Playwright (Imagens)",
     "reddit_playwright_fail": "⚠️ Falha ao extrair imagens do Reddit.",

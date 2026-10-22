@@ -33,6 +33,8 @@ def test_detect_platform_reddit_short_and_full():
 class _RedirectResponse:
     def __init__(self, url: str):
         self.url = url
+        self.status = 200
+        self.headers = {}
 
     async def __aenter__(self):
         return self
