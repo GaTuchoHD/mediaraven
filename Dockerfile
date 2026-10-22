@@ -7,7 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     METRICS_DB_PATH=/data/state/metrics.sqlite3 \
     MEDIA_CACHE_DB_PATH=/data/state/media_cache.db \
     FIREFOX_PROFILE_PATH=/data/cookies/firefox \
-    IG_SESSION_FILE=/data/state/ig_session.json
+    IG_SESSION_FILE=/data/state/ig_session.json \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 
 WORKDIR /app
 
@@ -17,7 +18,8 @@ RUN apt-get update \
 
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --no-cache-dir -r requirements.txt \
-    && python -m playwright install --with-deps chromium
+    && python -m playwright install --with-deps chromium \
+    && chmod -R a+rX /opt/ms-playwright
 
 RUN groupadd --gid 10001 mediaraven \
     && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /app mediaraven \
