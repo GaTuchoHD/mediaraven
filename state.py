@@ -14,6 +14,7 @@ from config import (
     IG_WORKERS,
     IO_WORKERS,
     MAX_CONCURRENT_REQUESTS,
+    MAX_PENDING_REQUESTS,
     PW_CONCURRENCY,
     YTDLP_WORKERS,
 )
@@ -60,11 +61,21 @@ _pending_requests = 0
 _last_request_at = 0.0
 
 
-def request_queued() -> None:
+def try_request_queued() -> bool:
+    """Reserve queue capacity before constructing a background task."""
     global _pending_requests, _last_request_at
     with _request_stats_lock:
+        if _pending_requests >= MAX_PENDING_REQUESTS:
+            return False
         _pending_requests += 1
         _last_request_at = time.time()
+        return True
+
+
+def request_queued() -> None:
+    """Compatibility helper; production ingress uses try_request_queued."""
+    if not try_request_queued():
+        raise RuntimeError("request queue full")
 
 
 def request_started() -> None:

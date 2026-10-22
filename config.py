@@ -75,6 +75,8 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 ALLOWED_CHAT_ID: list[int] = _csv_ints(os.getenv("ALLOWED_CHAT_ID", ""), "ALLOWED_CHAT_ID")
 ALLOWED_USER_ID: list[int] = _csv_ints(os.getenv("ALLOWED_USER_IDS", ""), "ALLOWED_USER_IDS")
+# Admin operations require explicit numeric IDs, never group/download privileges.
+ADMIN_USER_ID: list[int] = _csv_ints(os.getenv("ADMIN_USER_IDS", ""), "ADMIN_USER_IDS")
 ALLOWED_USERNAMES: frozenset[str] = frozenset(
     username.lstrip("@").casefold()
     for username in _csv_strings(os.getenv("ALLOWED_USERNAMES", ""))
@@ -142,6 +144,8 @@ PW_CONCURRENCY = _env_int("PW_CONCURRENCY", 3)
 
 MAX_URLS_PER_MESSAGE = _env_int("MAX_URLS_PER_MESSAGE", 20)
 MAX_CONCURRENT_REQUESTS = max(1, _env_int("MAX_CONCURRENT_REQUESTS", 4))
+MAX_PENDING_REQUESTS = max(1, _env_int("MAX_PENDING_REQUESTS", 100))
+MAX_QUEUE_WAIT_SECONDS = max(1, _env_int("MAX_QUEUE_WAIT_SECONDS", 180))
 IGNORED_DOMAINS: list[str] = _csv_strings(os.getenv("IGNORED_DOMAINS", ""))
 DOWNLOAD_TIMEOUT_SECONDS = _env_int("DOWNLOAD_TIMEOUT_SECONDS", 15)
 SAFE_URL_MAX_LENGTH = _env_int("SAFE_URL_MAX_LENGTH", 200)
