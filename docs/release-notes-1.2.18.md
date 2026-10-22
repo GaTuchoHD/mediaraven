@@ -32,3 +32,10 @@ Nenhuma credencial, cookie, token, endereço de servidor privado ou dado de prod
 A imagem e esta release somente serão publicadas pelo workflow após testes
 automatizados concluírem com sucesso. O status do workflow é a fonte de verdade;
 um commit isolado não significa build ou implantação validada.
+
+## Verificação da branch de auditoria
+
+- GitHub Actions Linux/Python 3.12: **442 testes aprovados, zero falhas, quatro avisos de depreciação**.
+- Docker build: **aprovado**.
+- Execução: https://github.com/GaTuchoHD/mediaraven/actions/runs/39857692712
+- Não foram efetuados downloads reais nem implantação na instalação privada.
