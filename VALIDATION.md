@@ -46,3 +46,17 @@ No environment files, cookies, session files, databases, browser profiles,
 logs, media, private Compose files or backups are published. Pattern scanning
 found only a dummy Telegram token already present in the public env examples.
 `git diff --check` was run. No production files were changed by this export.
+
+## Subsequent hardening validation — 2026-10-22
+
+The previous Windows result is a historical snapshot. After correcting the
+production templates and updating obsolete test doubles, GitHub Actions
+validated the hardening branch on Ubuntu with Python 3.12:
+
+- pytest: 442 passed, 0 failed, 4 PTB deprecation warnings.
+- pip check, compileall, critical Ruff checks: passed.
+- Docker image build: passed (build check only).
+- Evidence: https://github.com/GaTuchoHD/mediaraven/actions/runs/39857692712
+
+Windows was not rerun. No production NAS deployment or live Telegram/social
+media delivery was performed as part of this validation.
