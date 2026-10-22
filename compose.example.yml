@@ -1,0 +1,30 @@
+# Exemplo para uso local; não contém credenciais.
+# Copie .env_example para .env, configure em particular e nunca faça commit.
+services:
+  mediaraven:
+    image: ghcr.io/gatuchohd/mediaraven:v1.2.18-homelab
+    # Durante desenvolvimento, substitua image por: build: .
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      BASE_DOWNLOAD_DIR: /data/downloads
+      METRICS_DB_PATH: /data/state/metrics.sqlite3
+      MEDIA_CACHE_DB_PATH: /data/state/media_cache.db
+      FIREFOX_PROFILE_PATH: /data/cookies/firefox
+      IG_SESSION_FILE: /data/state/ig_session.json
+    volumes:
+      - ./data/downloads:/data/downloads
+      - ./data/state:/data/state
+      - ./data/cookies:/data/cookies
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 2g
+    shm_size: 256m
+    # Não publicar as portas de status/logs na LAN.
+    # LOCAL_API_HOST aponta para uma instância externa da Bot API.
+    # Bot API e MediaRaven devem ver /data/downloads no mesmo caminho.

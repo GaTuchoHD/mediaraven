@@ -10,10 +10,11 @@ from config import MEDIA_CACHE_ENABLED
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "media_cache.db")
+DB_PATH = os.getenv("MEDIA_CACHE_DB_PATH", os.path.join(os.path.dirname(__file__), "media_cache.db"))
 
 
 def _get_db():
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn

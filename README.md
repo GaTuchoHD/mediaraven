@@ -4,8 +4,8 @@ Bot do Telegram para extrair e enviar mídias de redes sociais, mantido no fork
 [GaTuchoHD/mediaraven](https://github.com/GaTuchoHD/mediaraven).
 
 Esta árvore contém a variante usada em produção, exportada em 22/10/2026.
-O código informa versão `1.2.17`; esta numeração é histórica e não significa
-que incorpora todas as mudanças do upstream `1.3.2`.
+O código informa versão `1.2.18`; esta é a linhagem da variante homelab e não
+significa que incorpora todas as mudanças do upstream `1.3.2`.
 
 ## Recursos da nossa versão
 
@@ -67,3 +67,25 @@ Variante de [lordaztur/mediaraven](https://github.com/lordaztur/mediaraven),
 com alterações operacionais e funcionais do Homelab. Mantida a licença MIT
 original em [LICENSE](LICENSE). Os créditos e avisos de copyright do código
 original permanecem aplicáveis.
+
+## Containers e segurança
+
+O `Dockerfile`, `compose.example.yml` e `.github/workflows/ci-release.yml`
+preparam builds públicos de Docker **sem segredos**. Use uma cópia local de
+`.env_example` como `.env`, nunca comite tokens ou cookies e não monte
+perfis privados na imagem durante o build. `ADMIN_USER_IDS` deve conter IDs
+numéricos reais configurados apenas no ambiente privado para habilitar
+comandos de manutenção; permissões de grupo não são administrativas.
+
+O `compose.example.yml` utiliza um servidor Telegram Bot API **externo**
+(`LOCAL_API_HOST`), que deve compartilhar o caminho de downloads do bot quando
+arquivos locais forem enviados. Confirme que o servidor Bot API enxerga os
+arquivos no mesmo caminho absoluto. Métricas e cache podem ser persistidos em
+`/data/state` com `METRICS_DB_PATH` e `MEDIA_CACHE_DB_PATH`.
+
+Arquivos temporários são apagados apenas sob `BASE_DOWNLOAD_DIR`. O Docker
+não impede sozinho requisições a redes privadas provenientes de ferramentas
+externas como FFmpeg, yt-dlp e navegadores; é obrigatório aplicar regras de
+egress na infraestrutura para isolar a rede de gerenciamento do NAS.
+
+Consulte [SECURITY.md](SECURITY.md) e [notas da versão](docs/release-notes-1.2.18.md).
