@@ -53,6 +53,10 @@ class _FakePage:
         assert event == "response"
         self.handler = handler
 
+    async def route(self, pattern, handler):
+        assert pattern == "**/*"
+        self.network_guard = handler
+
     async def goto(self, *_args, **_kwargs):
         self.handler(_FakeResponse())
 

@@ -32,6 +32,8 @@ def test_is_kwai_host_rejects_others():
 class _FakeResp:
     def __init__(self, final_url):
         self.url = final_url
+        self.status = 200
+        self.headers = {}
 
 
 @asynccontextmanager

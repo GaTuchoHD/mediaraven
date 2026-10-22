@@ -12,6 +12,8 @@ from downloaders import reddit_json
 class _FakeResponse:
     def __init__(self, payload):
         self._payload = payload
+        self.status = 200
+        self.headers = {}
 
     def raise_for_status(self):
         pass
