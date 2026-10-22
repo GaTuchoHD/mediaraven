@@ -13,6 +13,7 @@ from telegram.error import RetryAfter
 
 import state
 from config import cfg
+from url_safety import safe_aiohttp_get, validate_url
 from messages import lmsg, msg_list
 
 logger = logging.getLogger(__name__)
@@ -165,8 +166,9 @@ async def async_download_file(
     filepath: str,
     headers: Optional[dict] = None,
     return_content_type: bool = False,
+    cookies: Optional[dict[str, str]] = None,
 ):
-    """Baixa via aiohttp. Se return_content_type=True, retorna (ok, content_type)."""
+    """Baixa via aiohttp com validação de redirects e limite de bytes."""
     ct = ''
     owned_session = None
     try:
@@ -174,8 +176,9 @@ async def async_download_file(
         if session is None:
             owned_session = aiohttp.ClientSession()
             session = owned_session
-        async with session.get(
-            url, timeout=cfg("DOWNLOAD_TIMEOUT_SECONDS"), headers=headers,
+        async with safe_aiohttp_get(
+            session, url, timeout=cfg("DOWNLOAD_TIMEOUT_SECONDS"),
+            headers=headers, cookies=cookies,
         ) as response:
             ct = (response.headers.get('Content-Type') or '').lower()
             if response.status == 200:
@@ -236,37 +239,25 @@ async def async_download_via_playwright(
     filepath: str,
     referer: Optional[str] = None,
 ) -> bool:
-    """Fallback de download usando o contexto do Playwright (herda cookies + UA).
+    """Use authenticated Playwright cookies but stream bytes through safe aiohttp.
 
-    Útil quando o aiohttp leva 403 por falta de Referer/cookie de sessão.
+    Playwright APIResponse.body() buffers entire multi-GB videos in RAM; this
+    fallback instead enforces the same byte and redirect limits as normal HTTP.
     """
     if not state.PW_CONTEXT:
         return False
-    headers = {'Referer': referer} if referer else None
     try:
-        resp = await state.PW_CONTEXT.request.get(url, headers=headers, timeout=15000)
-    except Exception as e:
-        logger.warning(lmsg("utils.erro_pw_request", e=e))
+        cookie_list = await state.PW_CONTEXT.cookies([url])
+        cookies = {c["name"]: c["value"] for c in cookie_list}
+        headers = {"User-Agent": cfg("PLAYWRIGHT_UA")}
+        if referer:
+            headers["Referer"] = referer
+        return bool(await async_download_file(
+            url, filepath, headers=headers, cookies=cookies,
+        ))
+    except Exception as exc:
+        logger.warning("Download autenticado com cookies Playwright falhou (%s)", type(exc).__name__)
         return False
-    try:
-        if resp.status != 200:
-            logger.warning(lmsg("utils.skip_pw_http", arg0=resp.status, url=url))
-            return False
-        body = await resp.body()
-        if not body:
-            logger.warning(lmsg("utils.skip_pw_corpo", url=url))
-            return False
-        async with aiofiles.open(filepath, 'wb') as f:
-            await f.write(body)
-        return os.path.getsize(filepath) > 0
-    except Exception as e:
-        logger.warning(lmsg("utils.erro_escrevendo_pw", e=e))
-        return False
-    finally:
-        try:
-            await resp.dispose()
-        except Exception:
-            pass
 
 
 async def async_gif_to_mp4(input_path: str, output_path: str, timeout: int = 60) -> bool:
@@ -495,7 +486,9 @@ async def async_ffmpeg_remux(
     process = None
     ffmpeg_bin = state.FFMPEG_PATH or 'ffmpeg'
     try:
-        cmd = [ffmpeg_bin, '-y']
+        await validate_url(input_url)
+        # Prevent non-HTTP subprotocols (e.g. concat, gopher, local files).
+        cmd = [ffmpeg_bin, '-y', '-protocol_whitelist', 'http,https,tcp,tls,crypto']
         if headers:
             header_blob = ''.join(f"{k}: {v}\r\n" for k, v in headers.items())
             cmd.extend(['-headers', header_blob])
