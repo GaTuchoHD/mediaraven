@@ -1,114 +1,44 @@
 import asyncio
 import logging
 import os
-import re
-from types import SimpleNamespace
-from urllib.parse import urlparse
 
 import aiofiles
-import requests
-from curl_cffi import requests as curl_requests
 
 import state
 from config import cfg
-from cookies import get_aiohttp_cookies_for_url
 from messages import lmsg, msg
 from utils import async_merge_audio_image, safe_url
+from url_safety import safe_aiohttp_get
 
-from .instagram_embed import _extract_shortcode
+from ._caption import _normalize_caption_text
 
 logger = logging.getLogger(__name__)
 
-_WEB_APP_ID = "936619743392459"
-_SHORTCODE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-_STORY_RE = re.compile(r"/stories/[^/?#]+/(\d+)")
 
-
-def _shortcode_to_pk(shortcode: str) -> str:
-    # Base64 do Instagram; códigos de post privado são mais longos e só os 11 primeiros contam.
-    pk = 0
-    for ch in shortcode[:11]:
-        pk = pk * 64 + _SHORTCODE_ALPHABET.index(ch)
-    return str(pk)
-
-
-def _media_pk_from_url(url: str):
-    if m := _STORY_RE.search(url):
-        return m.group(1), None
-    if shortcode := _extract_shortcode(url):
-        return _shortcode_to_pk(shortcode), shortcode
-    return None, None
-
-
-def _best_url(versions) -> str | None:
-    versions = [v for v in versions or [] if v.get("url")]
-    return max(versions, key=lambda v: (v.get("width") or 0) * (v.get("height") or 0))["url"] if versions else None
-
-
-def _resource_from_v1(item: dict) -> SimpleNamespace:
-    # Mesma escolha do instagrapi: maior resolução de vídeo e de imagem.
-    return SimpleNamespace(
-        media_type=item.get("media_type"),
-        video_url=_best_url(item.get("video_versions")),
-        thumbnail_url=_best_url((item.get("image_versions2") or {}).get("candidates")),
-    )
-
-
-def _media_from_v1(item: dict) -> SimpleNamespace:
-    media = _resource_from_v1(item)
-    media.resources = [_resource_from_v1(c) for c in item.get("carousel_media") or []]
-    media.caption_text = (item.get("caption") or {}).get("text", "") or ""
-    return media
-
-
-def _web_media_info(url: str, timeout: float):
-    """media/{pk}/info pela API web com a sessão do Firefox (FIREFOX_PROFILE_PATH).
-
-    É o mesmo JSON que a API do app devolvia ao instagrapi, removido na v1.3.0 (o login
-    por senha leva 429 desde out/2026); a sessão web é a mesma do yt-dlp e do gallery-dl."""
-    media_pk, shortcode = _media_pk_from_url(url)
-    cookies = get_aiohttp_cookies_for_url("https://www.instagram.com/")
-    if not media_pk or "sessionid" not in cookies:
-        return None
-    r = curl_requests.get(
-        f"https://www.instagram.com/api/v1/media/{media_pk}/info/",
-        cookies=cookies, impersonate="chrome", timeout=timeout,
-        headers={
-            "X-IG-App-ID": _WEB_APP_ID,
-            "X-CSRFToken": cookies.get("csrftoken", ""),
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"https://www.instagram.com/p/{shortcode}/" if shortcode else "https://www.instagram.com/",
-        },
-    )
-    r.raise_for_status()
-    items = (r.json() or {}).get("items") or []
-    if not items:
-        return None
-    return _media_from_v1(items[0]), {"items": items}
-
-
-async def download_instagram_api(url: str, unique_folder: str) -> tuple[list[str], str, str, str]:
+async def download_instagram_instagrapi(url: str, unique_folder: str) -> tuple[list[str], str, str, str]:
     logger.info(lmsg("instagram.iniciando_instagrapi_para", arg0=safe_url(url)))
     if not os.path.exists(unique_folder):
         os.makedirs(unique_folder)
 
-    timeout = cfg("DOWNLOAD_TIMEOUT_SECONDS")
-
-    def fetch(media_url: str, path: str) -> str:
-        with requests.get(media_url, stream=True, timeout=timeout) as r:
-            r.raise_for_status()
-            with open(path, 'wb') as f:
-                for chunk in r.iter_content(64 * 1024):
-                    f.write(chunk)
-        return path
-
-    def perform_api():
+    def perform_instagrapi():
         try:
-            web = _web_media_info(url, timeout)
-            if not web:
-                logger.error(lmsg("instagram.cliente_instagrapi_n_o"))
-                return None
-            media_info, raw_data = web
+            client = state.IG_CLIENT
+            guest_client = client is None
+            if guest_client:
+                # Public posts can still be resolved through Instagram's public
+                # GraphQL endpoint. This is especially useful for Reels whose
+                # embed page exposes only the cover image and no video URL.
+                from instagrapi import Client
+
+                logger.info("Instagrapi autenticado indisponível; tentando cliente público.")
+                client = Client()
+
+            media_pk = client.media_pk_from_url(url)
+            media_info = (
+                client.media_info_gql(media_pk)
+                if guest_client
+                else client.media_info(media_pk)
+            )
 
             audio_url = None
             start_time_sec = None
@@ -121,9 +51,10 @@ async def download_instagram_api(url: str, unique_folder: str) -> tuple[list[str
                 media_info.media_type == 1
                 or (media_info.media_type == 8 and resource_count <= 1)
             )
-            if is_single_photo:
+            if is_single_photo and not guest_client:
                 try:
                     logger.info(lmsg("instagram.buscando_udio_e"))
+                    raw_data = client.private_request(f"media/{media_pk}/info/")
 
                     def extract_audio_data(data):
                         nonlocal audio_url, start_time_sec, overlap_duration_sec, track_duration_sec
@@ -152,17 +83,23 @@ async def download_instagram_api(url: str, unique_folder: str) -> tuple[list[str
                 except Exception as e:
                     logger.warning(lmsg("instagram.erro_ao_buscar", e=e))
 
-            resources = media_info.resources if media_info.media_type == 8 else [media_info]
             paths = []
-            for i, res in enumerate(resources):
-                media_url = res.video_url if res.media_type == 2 else res.thumbnail_url
-                if not media_url:
-                    continue
-                media_url = str(media_url)
-                ext = os.path.splitext(urlparse(media_url).path)[1] or ('.mp4' if res.media_type == 2 else '.jpg')
-                paths.append(fetch(media_url, os.path.join(unique_folder, f"ig_{i}{ext}")))
+            if media_info.media_type == 1:
+                paths.append(str(client.photo_download_by_url(
+                    str(media_info.thumbnail_url), folder=unique_folder)))
+            elif media_info.media_type == 2:
+                video_url = getattr(media_info, "video_url", None)
+                if video_url:
+                    paths.append(str(client.video_download_by_url(
+                        str(video_url), folder=unique_folder)))
+                else:
+                    paths.append(str(client.video_download(media_pk, folder=unique_folder)))
+            elif media_info.media_type == 8:
+                paths.extend([str(p) for p in client.album_download(media_pk, folder=unique_folder)])
 
-            caption_text = getattr(media_info, 'caption_text', "") or ""
+            caption_text = _normalize_caption_text(
+                getattr(media_info, 'caption_text', "") or ""
+            )
             return paths, audio_url, duration_sec, start_time_sec, media_info.media_type, caption_text, is_single_photo
         except Exception as e:
             logger.error(lmsg("instagram.instagrapi_falhou_x", e=e), exc_info=True)
@@ -174,7 +111,7 @@ async def download_instagram_api(url: str, unique_folder: str) -> tuple[list[str
 
     loop = asyncio.get_running_loop()
     try:
-        result = await loop.run_in_executor(state.IG_POOL, perform_api)
+        result = await loop.run_in_executor(state.IG_POOL, perform_instagrapi)
     finally:
         state.ig_pending_dec()
 
@@ -189,7 +126,9 @@ async def download_instagram_api(url: str, unique_folder: str) -> tuple[list[str
             logger.info(lmsg("instagram.baixando_udio_puro"))
             a_path = os.path.join(unique_folder, "temp_audio.m4a")
             headers_ig = {'User-Agent': cfg("IG_USER_AGENT")}
-            async with state.AIOHTTP_SESSION.get(audio_url, headers=headers_ig, timeout=15) as r:
+            async with safe_aiohttp_get(
+                state.AIOHTTP_SESSION, audio_url, headers=headers_ig, timeout=15,
+            ) as r:
                 if r.status == 200:
                     async with aiofiles.open(a_path, 'wb') as f:
                         async for chunk in r.content.iter_chunked(8192):
@@ -236,4 +175,4 @@ async def download_instagram_api(url: str, unique_folder: str) -> tuple[list[str
     else:
         caption_short = caption_text
 
-    return paths, msg("downloader_status.instagram_web", media_type=m_type), caption_short, caption_full
+    return paths, msg("downloader_status.instagrapi", media_type=m_type), caption_short, caption_full

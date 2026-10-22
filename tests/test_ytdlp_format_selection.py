@@ -1,46 +1,10 @@
 import os
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
-import pytest
 from yt_dlp import YoutubeDL
 
 from downloaders import _ytdlp
 from downloaders._platform import Platform
-
-
-@pytest.mark.parametrize("info,expected", [
-    ({"live_status": "is_live"}, "live_in_progress"),
-    ({"is_live": True}, "live_in_progress"),
-    ({"is_live": True, "live_status": "is_live"}, "live_in_progress"),
-    ({"live_status": "is_upcoming"}, "live_not_started"),
-    ({"live_status": "was_live"}, None),
-    ({"live_status": "post_live"}, None),
-    ({"live_status": "not_live"}, None),
-    ({"is_live": False}, None),
-    ({}, None),
-    (None, None),
-])
-def test_live_reason(info, expected):
-    assert _ytdlp._live_reason(info) == expected
-
-
-@pytest.mark.asyncio
-async def test_run_ytdlp_cancels_download_on_live(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        _ytdlp, "_pre_extract",
-        AsyncMock(return_value={"live_status": "is_live", "title": "LIVE AGORA"}),
-    )
-    extract_spy = MagicMock()
-    monkeypatch.setattr(_ytdlp, "_yt_dlp_extract", extract_spy)
-
-    files, info, reason = await _ytdlp._run_ytdlp_with_cookie_fallback(
-        {}, "https://youtube.com/watch?v=abc", str(tmp_path / "nope"),
-        has_firefox_cookie=False, target_lang=None, platform=Platform(youtube=True),
-    )
-
-    assert files == []
-    assert reason == "live_in_progress"
-    extract_spy.assert_not_called()
 
 
 def test_base_opts_outtmpl_truncates_long_title():
@@ -130,6 +94,21 @@ def test_build_format_selector_youtube_with_lang():
     assert '[filesize_approx<2000M]' in sel
 
 
+def test_build_progressive_fallback_selector_prefers_combined_mp4():
+    sel = _ytdlp._build_progressive_fallback_selector(1080, 2000)
+    tiers = sel.split('/')
+    assert tiers[0] == 'best[height<=1080][ext=mp4][filesize_approx<2000M]'
+    assert tiers[1] == 'best[height<=1080][ext=mp4]'
+    assert tiers[-1] == 'best'
+
+
+def test_has_http_403_detects_youtube_media_failure():
+    assert _ytdlp._has_http_403([
+        'ERROR: unable to download video data: HTTP Error 403: Forbidden'
+    ]) is True
+    assert _ytdlp._has_http_403(['Sign in to confirm you are not a bot']) is False
+
+
 def test_apply_format_selection_no_info_falls_back_to_static_cap():
     opts = {}
     platform = Platform(youtube=True)
@@ -167,9 +146,8 @@ def test_apply_format_selection_progressive_keeps_max_height():
     assert '[height<=1920]' in opts['format']
 
 
-def test_apply_format_selection_reddit_keeps_impersonate_by_default():
-    from yt_dlp.networking.impersonate import ImpersonateTarget
-    opts = {'impersonate': ImpersonateTarget('chrome')}
+def test_apply_format_selection_reddit_sets_impersonate_by_default():
+    opts = {}
     platform = Platform(reddit=True)
     with patch.object(_ytdlp, 'cfg', lambda k: {'YTDLP_MAX_HEIGHT': 1920, 'TELEGRAM_MAX_UPLOAD_MB': 2000, 'YTDLP_HLS_MAX_HEIGHT': 720}.get(k)):
         _ytdlp._apply_format_selection(opts, platform, None)
@@ -193,14 +171,13 @@ def test_apply_format_selection_pops_existing_impersonate_when_disabled():
     assert 'impersonate' not in opts
 
 
-def test_apply_format_selection_facebook_keeps_or_pops_impersonate():
-    from yt_dlp.networking.impersonate import ImpersonateTarget
+def test_apply_format_selection_facebook_keeps_impersonate_even_with_use_imp_false():
+    opts = {}
     platform = Platform(facebook=True)
-    opts = {'impersonate': ImpersonateTarget('chrome')}
     with patch.object(_ytdlp, 'cfg', lambda k: {'YTDLP_MAX_HEIGHT': 1920, 'TELEGRAM_MAX_UPLOAD_MB': 2000, 'YTDLP_HLS_MAX_HEIGHT': 720}.get(k)):
         _ytdlp._apply_format_selection(opts, platform, None)
     assert 'impersonate' in opts
-    opts2 = {'impersonate': ImpersonateTarget('chrome')}
+    opts2 = {}
     with patch.object(_ytdlp, 'cfg', lambda k: {'YTDLP_MAX_HEIGHT': 1920, 'TELEGRAM_MAX_UPLOAD_MB': 2000, 'YTDLP_HLS_MAX_HEIGHT': 720}.get(k)):
         _ytdlp._apply_format_selection(opts2, platform, None, use_impersonate=False)
     assert 'impersonate' not in opts2
@@ -232,76 +209,17 @@ def test_expand_attempts_youtube_and_other_skip_no_imp_path():
         assert expanded == [('no_cookie', True), ('with_cookie', True)]
 
 
-@pytest.mark.parametrize("url", [
-    "https://www.tiktok.com/@g1/video/7633238536191364353",
-    "https://vt.tiktok.com/ZSX7fMpYn",
-    "https://vm.tiktok.com/abc123/",
-])
-def test_detect_platform_recognizes_tiktok(url):
-    from downloaders._platform import _detect_platform
-    assert _detect_platform(url).tiktok is True
-
-
-def test_detect_platform_non_tiktok_is_false():
-    from downloaders._platform import _detect_platform
-    assert _detect_platform("https://www.youtube.com/watch?v=x").tiktok is False
-
-
-def test_attempt_order_tiktok_prioritizes_cookies():
-    tiktok = Platform(tiktok=True)
-    assert _ytdlp._attempt_order(True, None, tiktok) == ["with_cookie", "no_cookie"]
-    assert _ytdlp._attempt_order(False, None, tiktok) == ["no_cookie"]
-
-
-def test_attempt_order_non_tiktok_keeps_no_cookie_first():
-    assert _ytdlp._attempt_order(True, None, Platform(youtube=True)) == ["no_cookie", "with_cookie"]
-    assert _ytdlp._attempt_order(True, None, None) == ["no_cookie", "with_cookie"]
-
-
-def test_apply_format_selection_tiktok_keeps_impersonate():
-    from yt_dlp.networking.impersonate import ImpersonateTarget
-    opts = {'impersonate': ImpersonateTarget('chrome')}
-    with patch.object(_ytdlp, 'cfg', lambda k: {'YTDLP_MAX_HEIGHT': 1920, 'TELEGRAM_MAX_UPLOAD_MB': 2000, 'YTDLP_HLS_MAX_HEIGHT': 720}.get(k)):
-        _ytdlp._apply_format_selection(opts, Platform(tiktok=True), None, use_impersonate=True)
-    assert 'impersonate' in opts
-
-
-def test_build_base_opts_sets_impersonate_for_all_including_youtube():
-    from yt_dlp.networking.impersonate import ImpersonateTarget
-    with patch.object(_ytdlp, 'cfg', lambda k: {'YTDLP_SOCKET_TIMEOUT': 90, 'YTDLP_YT_CLIENTS': 'default'}.get(k)):
-        base = _ytdlp._build_ytdlp_base_opts('/tmp/x')
-    assert isinstance(base.get('impersonate'), ImpersonateTarget)
-    opts = dict(base)
-    with patch.object(_ytdlp, 'cfg', lambda k: {'YTDLP_MAX_HEIGHT': 1920, 'TELEGRAM_MAX_UPLOAD_MB': 2000, 'YTDLP_HLS_MAX_HEIGHT': 720}.get(k)):
-        _ytdlp._apply_format_selection(opts, Platform(youtube=True), None)
-    assert 'impersonate' in opts
-
-
-def test_apply_format_selection_tiktok_sets_proxy_when_configured():
-    cfg_vals = {'YTDLP_MAX_HEIGHT': 1920, 'TELEGRAM_MAX_UPLOAD_MB': 2000, 'YTDLP_HLS_MAX_HEIGHT': 720,
-                'TIKTOK_PROXY': 'http://127.0.0.1:8888'}
-    opts = {}
-    with patch.object(_ytdlp, 'cfg', lambda k: cfg_vals.get(k)):
-        _ytdlp._apply_format_selection(opts, Platform(tiktok=True), None, use_impersonate=True)
-    assert opts.get('proxy') == 'http://127.0.0.1:8888'
-
-
-def test_apply_format_selection_tiktok_no_proxy_when_empty():
-    cfg_vals = {'YTDLP_MAX_HEIGHT': 1920, 'TELEGRAM_MAX_UPLOAD_MB': 2000, 'YTDLP_HLS_MAX_HEIGHT': 720,
-                'TIKTOK_PROXY': ''}
-    opts = {}
-    with patch.object(_ytdlp, 'cfg', lambda k: cfg_vals.get(k)):
-        _ytdlp._apply_format_selection(opts, Platform(tiktok=True), None, use_impersonate=True)
-    assert 'proxy' not in opts
-
-
-def test_apply_format_selection_non_tiktok_ignores_proxy():
-    cfg_vals = {'YTDLP_MAX_HEIGHT': 1920, 'TELEGRAM_MAX_UPLOAD_MB': 2000, 'YTDLP_HLS_MAX_HEIGHT': 720,
-                'TIKTOK_PROXY': 'http://127.0.0.1:8888'}
-    opts = {}
-    with patch.object(_ytdlp, 'cfg', lambda k: cfg_vals.get(k)):
-        _ytdlp._apply_format_selection(opts, Platform(youtube=True), None, use_impersonate=True)
-    assert 'proxy' not in opts
+def test_attempt_order_can_prioritize_cookie_for_youtube():
+    assert _ytdlp._attempt_order(
+        has_firefox_cookie=True,
+        target_lang=None,
+        prefer_cookie=True,
+    ) == ['with_cookie', 'no_cookie']
+    assert _ytdlp._attempt_order(
+        has_firefox_cookie=False,
+        target_lang=None,
+        prefer_cookie=True,
+    ) == ['no_cookie']
 
 
 def test_classify_ytdlp_errors_private():

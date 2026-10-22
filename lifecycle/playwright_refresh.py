@@ -7,6 +7,7 @@ import psutil
 import state
 from config import (
     PLAYWRIGHT_UA,
+    PW_CONCURRENCY,
     PW_REFRESH_CHECK_INTERVAL_MIN,
     PW_REFRESH_MAX_INTERVAL_HOURS,
     PW_REFRESH_MIN_INTERVAL_MIN,
@@ -70,7 +71,6 @@ async def periodic_playwright_refresh() -> None:
             new_context = await state.PW_BROWSER.new_context(
                 user_agent=PLAYWRIGHT_UA,
                 viewport={'width': PW_VIEWPORT_WIDTH, 'height': PW_VIEWPORT_HEIGHT},
-                service_workers="block",  # ver init_globals em services.py
             )
 
             state.FIREFOX_COOKIES_CACHE = extract_firefox_cookies()
@@ -82,12 +82,11 @@ async def periodic_playwright_refresh() -> None:
                 except Exception as e:
                     logger.warning(lmsg("playwright_refresh.erro_ao_injetar", e=e))
 
-            tickets = []
-            for _ in range(3):
-                await state.PW_SEMAPHORE.acquire()
-                tickets.append(True)
-
+            tickets = 0
             try:
+                for _ in range(PW_CONCURRENCY):
+                    await state.PW_SEMAPHORE.acquire()
+                    tickets += 1
                 old_context = state.PW_CONTEXT
                 state.PW_CONTEXT = new_context
 
@@ -96,7 +95,7 @@ async def periodic_playwright_refresh() -> None:
 
                 logger.info(lmsg("playwright_refresh.contexto_playwright_recriado"))
             finally:
-                for _ in tickets:
+                for _ in range(tickets):
                     state.PW_SEMAPHORE.release()
 
         except Exception as e:

@@ -122,3 +122,13 @@ $RECYCLE.BIN/
 .claude/
 .aider*
 .cursor/
+
+# Private production state
+/cookies/
+/*cookie*.txt
+/reddit_pw_cookies.json
+*.sqlite*
+*.db*
+*.bak*
+/backups/
+/.staging/

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from downloaders import dispatcher
+from downloaders._platform import Platform
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +36,35 @@ def _passthrough_async_mock():
     async def passthrough(url):
         return url
     return AsyncMock(side_effect=passthrough)
+
+
+def test_platform_label_includes_urlebird():
+    assert dispatcher._platform_label(Platform(urlebird=True)) == "urlebird"
+
+
+@pytest.mark.asyncio
+async def test_download_media_urlebird_uses_direct_fast_path(tmp_folder):
+    fake_file = os.path.join(tmp_folder, "urlebird.mp4")
+    direct_mock = AsyncMock(return_value=(
+        [fake_file], "STATUS_URLEBIRD", "@user caption", "@user caption",
+    ))
+    ytdlp_mock = AsyncMock(return_value=([], {}, None))
+
+    with patch.object(dispatcher, "download_urlebird", new=direct_mock), \
+         patch.object(dispatcher, "_run_ytdlp_with_cookie_fallback", new=ytdlp_mock):
+        files, status, short, full, is_article = await dispatcher.download_media(
+            "https://urlebird.com/video/example-7638961428594019604/",
+            tmp_folder,
+            target_lang=None,
+        )
+
+    assert files == [fake_file]
+    assert status == "STATUS_URLEBIRD"
+    assert short == "@user caption"
+    assert full == "@user caption"
+    assert is_article is False
+    direct_mock.assert_awaited_once()
+    ytdlp_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -79,23 +109,6 @@ async def test_download_media_falls_back_to_scraper(tmp_folder):
 
 
 @pytest.mark.asyncio
-async def test_youtube_ytdlp_failure_skips_scraper(tmp_folder):
-    """YouTube: se o yt-dlp falha, NÃO roda o scraper (evita despejar fragmentos DASH)."""
-    scrape_mock = AsyncMock(return_value=([os.path.join(tmp_folder, "frag.mp4")], "SCRAPE", "", "", False))
-    with patch.object(dispatcher, "_run_ytdlp_with_cookie_fallback",
-                      new=AsyncMock(return_value=([], {}, None))), \
-         patch.object(dispatcher, "_resolve_short_reddit_url", new=_passthrough_async_mock()), \
-         patch.object(dispatcher, "_detect_youtube_languages", new=AsyncMock(return_value=None)), \
-         patch.object(dispatcher, "scrape_fallback", new=scrape_mock):
-        files, status, short, full, is_article = await dispatcher.download_media(
-            "https://youtu.be/abc123", tmp_folder, target_lang=None
-        )
-
-    assert files == []
-    assert scrape_mock.await_count == 0
-
-
-@pytest.mark.asyncio
 async def test_download_media_scraper_returns_article_caption(tmp_folder):
     scraped_file = os.path.join(tmp_folder, "article_cover.jpg")
     article_short = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 6
@@ -123,7 +136,7 @@ async def test_download_media_reddit_tries_json_first(tmp_folder):
     reddit_json_file = os.path.join(tmp_folder, "rj.jpg")
     call_order = []
 
-    async def reddit_json_mock(url, folder, post_data=None):
+    async def reddit_json_mock(url, folder):
         call_order.append("json")
         return [reddit_json_file], "OK_JSON", "OK_CAP", "OK_CAP_FULL"
 
@@ -141,7 +154,6 @@ async def test_download_media_reddit_tries_json_first(tmp_folder):
 
     with patch.object(dispatcher, "_run_ytdlp_with_cookie_fallback", new=AsyncMock(side_effect=ytdlp_mock)), \
          patch.object(dispatcher, "_resolve_short_reddit_url", new=_passthrough_async_mock()), \
-         patch.object(dispatcher, "resolve_reddit_external_link", new=AsyncMock(return_value=(None, None))), \
          patch.object(dispatcher, "download_reddit_json", new=AsyncMock(side_effect=reddit_json_mock)), \
          patch.object(dispatcher, "download_reddit_playwright", new=AsyncMock(side_effect=reddit_pw_mock)), \
          patch.object(dispatcher, "scrape_fallback", new=AsyncMock(side_effect=scrape_mock)):
@@ -163,9 +175,9 @@ async def test_download_media_reddit_video_falls_back_to_ytdlp(tmp_folder):
         f.write(b"x")
     call_order = []
 
-    async def reddit_json_mock(url, folder, post_data=None):
+    async def reddit_json_mock(url, folder):
         call_order.append("json")
-        return [], "fail", "", ""
+        return [], dispatcher.REDDIT_JSON_VIDEO, "", ""
 
     async def ytdlp_mock(*a, **kw):
         call_order.append("ytdlp")
@@ -173,7 +185,6 @@ async def test_download_media_reddit_video_falls_back_to_ytdlp(tmp_folder):
 
     with patch.object(dispatcher, "_run_ytdlp_with_cookie_fallback", new=AsyncMock(side_effect=ytdlp_mock)), \
          patch.object(dispatcher, "_resolve_short_reddit_url", new=_passthrough_async_mock()), \
-         patch.object(dispatcher, "resolve_reddit_external_link", new=AsyncMock(return_value=(None, None))), \
          patch.object(dispatcher, "download_reddit_json", new=AsyncMock(side_effect=reddit_json_mock)):
         files, status, short, full, is_article = await dispatcher.download_media(
             "https://reddit.com/r/foo/comments/y/", tmp_folder, target_lang=None
@@ -185,92 +196,114 @@ async def test_download_media_reddit_video_falls_back_to_ytdlp(tmp_folder):
 
 
 @pytest.mark.asyncio
-async def test_reddit_external_known_target_redispatches(tmp_folder):
-    """Post do Reddit que é link pra YouTube -> baixa como se o YouTube fosse enviado."""
-    yt_file = os.path.join(tmp_folder, "yt.mp4")
-    with open(yt_file, "wb") as f:
-        f.write(b"x")
-    link = {"external_url": "https://youtu.be/abc123", "title": "t", "thumbnail_url": None}
+async def test_removed_reddit_post_returns_user_message_without_fallback(tmp_folder):
+    url = 'https://reddit.com/r/foo/comments/removed/'
+    html = AsyncMock()
+    ytdlp = AsyncMock()
+    with (
+        patch.object(dispatcher, '_resolve_short_reddit_url', AsyncMock(return_value=url)),
+        patch.object(dispatcher, 'download_reddit_json', AsyncMock(
+            return_value=([], dispatcher.REDDIT_UNAVAILABLE, '', ''))),
+        patch.object(dispatcher, '_record_failure', AsyncMock()),
+        patch.object(dispatcher, 'download_reddit_playwright', html),
+        patch.object(dispatcher, '_run_ytdlp_with_cookie_fallback', ytdlp),
+    ):
+        files, status, short, full, _ = await dispatcher.download_media(url, tmp_folder)
 
-    async def ytdlp_mock(*a, **kw):
-        return [yt_file], {"title": "vídeo do youtube"}, None
-
-    with patch.object(dispatcher, "_run_ytdlp_with_cookie_fallback", new=AsyncMock(side_effect=ytdlp_mock)), \
-         patch.object(dispatcher, "_resolve_short_reddit_url", new=_passthrough_async_mock()), \
-         patch.object(dispatcher, "resolve_reddit_external_link", new=AsyncMock(return_value=(link, {}))), \
-         patch.object(dispatcher, "_detect_youtube_languages", new=AsyncMock(return_value=None)):
-        files, status, short, full, is_article = await dispatcher.download_media(
-            "https://www.reddit.com/r/videos/comments/x/", tmp_folder, target_lang=None
-        )
-
-    assert files == [yt_file]
-    assert "vídeo do youtube" in short
-
-
-@pytest.mark.asyncio
-async def test_reddit_external_news_redispatches_as_if_sent(tmp_folder):
-    """Post do Reddit que é link de notícia -> baixa a notícia como se o link fosse enviado (scraper/artigo)."""
-    scraped = os.path.join(tmp_folder, "scrape_media_0.jpg")
-    link = {
-        "external_url": "https://g1.globo.com/materia.html",
-        "title": "Manchete da Notícia",
-        "thumbnail_url": "https://preview.redd.it/x.jpg?s=abc",
-    }
-
-    async def ytdlp_mock(*a, **kw):
-        return [], {}, None
-
-    async def scrape_mock(url, folder):
-        assert "g1.globo.com" in url
-        return [scraped], "STATUS_SCRAPE", "Corpo da notícia", "Corpo completo da notícia", True
-
-    with patch.object(dispatcher, "_run_ytdlp_with_cookie_fallback", new=AsyncMock(side_effect=ytdlp_mock)), \
-         patch.object(dispatcher, "_resolve_short_reddit_url", new=_passthrough_async_mock()), \
-         patch.object(dispatcher, "resolve_reddit_external_link", new=AsyncMock(return_value=(link, {}))), \
-         patch.object(dispatcher, "scrape_fallback", new=AsyncMock(side_effect=scrape_mock)):
-        files, status, short, full, is_article = await dispatcher.download_media(
-            "https://www.reddit.com/r/brasil/comments/y/", tmp_folder, target_lang=None
-        )
-
-    assert files == [scraped]
-    assert "Corpo da notícia" in short
+    assert not files
+    assert 'removido ou indisponível' in status
+    assert not short
+    assert 'removido ou indisponível' in full
+    html.assert_not_awaited()
+    ytdlp.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_reddit_external_empty_redispatch_falls_back_to_news_card(tmp_folder):
-    """Se o re-despacho não trouxer nada, cai no card: thumb + título + link da notícia."""
-    thumb_file = os.path.join(tmp_folder, "reddit_link_thumb.jpg")
-    link = {
-        "external_url": "https://g1.globo.com/materia.html",
-        "title": "Manchete da Notícia",
-        "thumbnail_url": "https://preview.redd.it/x.jpg?s=abc",
-    }
+async def test_reddit_extraction_failure_returns_cautious_user_message(tmp_folder):
+    url = 'https://reddit.com/r/foo/comments/unavailable/'
+    record_failure = AsyncMock()
+    record_success = AsyncMock()
+    with (
+        patch.object(dispatcher, '_resolve_short_reddit_url', AsyncMock(return_value=url)),
+        patch.object(dispatcher, 'download_reddit_json', AsyncMock(
+            return_value=([], 'json_fail', '', ''))),
+        patch.object(dispatcher, '_record_failure', record_failure),
+        patch.object(dispatcher, '_record_success', record_success),
+        patch.object(dispatcher, 'download_reddit_playwright', AsyncMock(
+            return_value=([], 'html_fail', '', ''))),
+        patch.object(dispatcher, '_run_ytdlp_with_cookie_fallback', AsyncMock(
+            return_value=([], {}, None))),
+        patch.object(dispatcher, 'scrape_fallback', AsyncMock(
+            return_value=([], '', '', '', False))),
+    ):
+        files, status, short, full, _ = await dispatcher.download_media(url, tmp_folder)
 
-    async def ytdlp_mock(*a, **kw):
+    assert not files
+    assert 'Reddit' in status
+    assert not short
+    assert 'removido' in full.lower()
+    assert 'temporariamente' in full.lower()
+    record_failure.assert_awaited_once()
+    record_success.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reddit_playwright_warning_without_files_is_not_success(tmp_folder):
+    url = 'https://reddit.com/r/foo/comments/video/'
+    record_failure = AsyncMock()
+    record_success = AsyncMock()
+    with (
+        patch.object(dispatcher, '_resolve_short_reddit_url', AsyncMock(return_value=url)),
+        patch.object(dispatcher, 'download_reddit_json', AsyncMock(
+            return_value=([], dispatcher.REDDIT_JSON_VIDEO, '', ''))),
+        patch.object(dispatcher, '_record_failure', record_failure),
+        patch.object(dispatcher, '_record_success', record_success),
+        patch.object(dispatcher, 'download_reddit_playwright', AsyncMock(
+            return_value=([], '⚠️ Falha ao extrair imagens do Reddit.', '', ''))),
+        patch.object(dispatcher, '_run_ytdlp_with_cookie_fallback', AsyncMock(
+            return_value=([], {}, None))),
+        patch.object(dispatcher, 'scrape_fallback', AsyncMock(
+            return_value=([], '', '', '', False))),
+    ):
+        files, status, _short, full, _ = await dispatcher.download_media(url, tmp_folder)
+
+    assert not files
+    assert 'Reddit' in status
+    assert 'removido' in full.lower()
+    record_failure.assert_awaited_once()
+    record_success.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_download_media_reddit_json_failure_tries_html_before_ytdlp(tmp_folder):
+    image_file = os.path.join(tmp_folder, "reddit.jpg")
+    with open(image_file, "wb") as f:
+        f.write(b"image")
+    call_order = []
+
+    async def reddit_json_mock(url, folder):
+        call_order.append("json")
+        return [], "json_fail", "", ""
+
+    async def reddit_html_mock(url, folder):
+        call_order.append("html")
+        return [image_file], "OK_HTML", "CAP", "CAP_FULL"
+
+    async def ytdlp_mock(*args, **kwargs):
+        call_order.append("ytdlp")
         return [], {}, None
-
-    async def scrape_mock(url, folder):
-        return [], "fail", "", "", False
-
-    async def fake_download(url, path):
-        with open(path, "wb") as f:
-            f.write(b"jpeg")
-        return True
 
     with patch.object(dispatcher, "_run_ytdlp_with_cookie_fallback", new=AsyncMock(side_effect=ytdlp_mock)), \
          patch.object(dispatcher, "_resolve_short_reddit_url", new=_passthrough_async_mock()), \
-         patch.object(dispatcher, "resolve_reddit_external_link", new=AsyncMock(return_value=(link, {}))), \
-         patch.object(dispatcher, "scrape_fallback", new=AsyncMock(side_effect=scrape_mock)), \
-         patch.object(dispatcher, "async_download_file", new=AsyncMock(side_effect=fake_download)), \
-         patch.object(dispatcher, "normalize_image", new=lambda p, min_size=1: p):
+         patch.object(dispatcher, "download_reddit_json", new=AsyncMock(side_effect=reddit_json_mock)), \
+         patch.object(dispatcher, "download_reddit_playwright", new=AsyncMock(side_effect=reddit_html_mock)):
         files, status, short, full, is_article = await dispatcher.download_media(
-            "https://www.reddit.com/r/brasil/comments/z/", tmp_folder, target_lang=None
+            "https://reddit.com/r/foo/comments/image/", tmp_folder, target_lang=None,
         )
 
-    assert files == [thumb_file]
-    assert is_article is True
-    assert "Manchete da Notícia" in short
-    assert "g1.globo.com/materia.html" in full
+    assert files == [image_file]
+    assert status == "OK_HTML"
+    assert call_order == ["json", "html"]
 
 
 @pytest.mark.asyncio
@@ -324,6 +357,33 @@ async def test_download_media_skips_fallbacks_on_unrecoverable(tmp_folder):
 
 
 @pytest.mark.asyncio
+async def test_download_media_prefers_authenticated_instagrapi_before_ytdlp(
+    tmp_folder, monkeypatch,
+):
+    ig_file = os.path.join(tmp_folder, "reel.mp4")
+    with open(ig_file, "wb") as f:
+        f.write(b"x")
+
+    instagrapi_mock = AsyncMock(return_value=([ig_file], "IG_STATUS", "leg", "leg"))
+    ytdlp_mock = AsyncMock(return_value=([], {}, "sign_in_required"))
+    monkeypatch.setattr(dispatcher.state, "IG_CLIENT", object())
+
+    with patch.object(dispatcher, "_resolve_short_reddit_url", new=_passthrough_async_mock()), \
+         patch.object(dispatcher, "download_instagram_embed",
+                      new=AsyncMock(return_value=([], "", "", ""))), \
+         patch.object(dispatcher, "download_instagram_instagrapi", new=instagrapi_mock), \
+         patch.object(dispatcher, "_run_ytdlp_with_cookie_fallback", new=ytdlp_mock):
+        files, status, short, full, is_article = await dispatcher.download_media(
+            "https://www.instagram.com/reel/ABC123/", tmp_folder, target_lang=None
+        )
+
+    assert files == [ig_file]
+    assert status == "IG_STATUS"
+    assert instagrapi_mock.await_count == 1
+    assert ytdlp_mock.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_download_media_instagram_sign_in_required_tries_instagrapi(tmp_folder):
     ig_file = os.path.join(tmp_folder, "reel.mp4")
     with open(ig_file, "wb") as f:
@@ -335,7 +395,7 @@ async def test_download_media_instagram_sign_in_required_tries_instagrapi(tmp_fo
          patch.object(dispatcher, "_resolve_short_reddit_url", new=_passthrough_async_mock()), \
          patch.object(dispatcher, "download_instagram_embed",
                       new=AsyncMock(return_value=([], "", "", ""))), \
-         patch.object(dispatcher, "download_instagram_api", new=instagrapi_mock), \
+         patch.object(dispatcher, "download_instagram_instagrapi", new=instagrapi_mock), \
          patch.object(dispatcher, "scrape_fallback", new=scrape_mock):
         files, status, short, full, is_article = await dispatcher.download_media(
             "https://www.instagram.com/reels/ABC123/", tmp_folder, target_lang=None
@@ -350,15 +410,13 @@ async def test_download_media_instagram_sign_in_required_tries_instagrapi(tmp_fo
 @pytest.mark.asyncio
 async def test_download_media_instagram_sign_in_required_gives_up_without_scraper(tmp_folder):
     instagrapi_mock = AsyncMock(return_value=([], "", "", ""))
-    gallery_dl_mock = AsyncMock(return_value=[])
     scrape_mock = AsyncMock(return_value=([], "fail", "", "", False))
     with patch.object(dispatcher, "_run_ytdlp_with_cookie_fallback",
                       new=AsyncMock(return_value=([], {}, "sign_in_required"))), \
          patch.object(dispatcher, "_resolve_short_reddit_url", new=_passthrough_async_mock()), \
          patch.object(dispatcher, "download_instagram_embed",
                       new=AsyncMock(return_value=([], "", "", ""))), \
-         patch.object(dispatcher, "download_instagram_api", new=instagrapi_mock), \
-         patch.object(dispatcher, "_gallery_dl_run", new=gallery_dl_mock), \
+         patch.object(dispatcher, "download_instagram_instagrapi", new=instagrapi_mock), \
          patch.object(dispatcher, "scrape_fallback", new=scrape_mock):
         files, status, short, full, is_article = await dispatcher.download_media(
             "https://www.instagram.com/reels/ABC123/", tmp_folder, target_lang=None
@@ -366,37 +424,8 @@ async def test_download_media_instagram_sign_in_required_gives_up_without_scrape
 
     assert files == []
     assert instagrapi_mock.await_count == 1
-    assert gallery_dl_mock.await_count == 1
     assert scrape_mock.await_count == 0
     assert "login" in status.lower()
-
-
-@pytest.mark.asyncio
-async def test_download_media_instagram_sign_in_required_falls_back_to_gallery_dl(tmp_folder):
-    gdl_file = os.path.join(tmp_folder, "galdl_001.jpg")
-    with open(gdl_file, "wb") as f:
-        f.write(b"x")
-    instagrapi_mock = AsyncMock(return_value=([], "", "", ""))
-    gallery_dl_mock = AsyncMock(return_value=[gdl_file])
-    scrape_mock = AsyncMock(return_value=([], "fail", "", "", False))
-    with patch.object(dispatcher, "_run_ytdlp_with_cookie_fallback",
-                      new=AsyncMock(return_value=([], {}, "sign_in_required"))), \
-         patch.object(dispatcher, "_resolve_short_reddit_url", new=_passthrough_async_mock()), \
-         patch.object(dispatcher, "download_instagram_embed",
-                      new=AsyncMock(return_value=([], "", "", ""))), \
-         patch.object(dispatcher, "download_instagram_api", new=instagrapi_mock), \
-         patch.object(dispatcher, "_gallery_dl_run", new=gallery_dl_mock), \
-         patch.object(dispatcher, "_wipe_folder", new=lambda *_: None), \
-         patch.object(dispatcher, "scrape_fallback", new=scrape_mock):
-        files, status, short, full, is_article = await dispatcher.download_media(
-            "https://www.instagram.com/p/ABC123/", tmp_folder, target_lang=None
-        )
-
-    assert files == [gdl_file]
-    assert "gallery-dl" in status
-    assert instagrapi_mock.await_count == 1
-    assert gallery_dl_mock.await_count == 1
-    assert scrape_mock.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -408,7 +437,7 @@ async def test_download_media_instagram_private_does_not_retry_instagrapi(tmp_fo
          patch.object(dispatcher, "_resolve_short_reddit_url", new=_passthrough_async_mock()), \
          patch.object(dispatcher, "download_instagram_embed",
                       new=AsyncMock(return_value=([], "", "", ""))), \
-         patch.object(dispatcher, "download_instagram_api", new=instagrapi_mock), \
+         patch.object(dispatcher, "download_instagram_instagrapi", new=instagrapi_mock), \
          patch.object(dispatcher, "scrape_fallback", new=scrape_mock):
         files, status, short, full, is_article = await dispatcher.download_media(
             "https://www.instagram.com/reels/ABC123/", tmp_folder, target_lang=None

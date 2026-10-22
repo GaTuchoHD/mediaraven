@@ -64,22 +64,23 @@
     "ytdlp_age_restricted": "🔞 Age-restricted video.",
     "ytdlp_sign_in_required": "🔑 Video requires login (the bot's account doesn't have access).",
     "ytdlp_live_not_started": "📅 Live hasn't started yet.",
-    "ytdlp_live_in_progress": "🔴 Live in progress. Download cancelled.",
     "ytdlp_rate_limited": "⏳ Rate-limited by the platform. Try again in a moment.",
     "threads_fail": "⚠️ Failed to process this Threads link.",
     "generic_fail": "❌ Couldn't download the media.",
     "instagram_embed": "📸 IG Embed ({media_type})",
     "instagram_embed_fail": "⚠️ Failed to extract via Instagram embed.",
-    "instagram_web": "📸 Instagram Web ({media_type})",
+    "instagrapi": "📸 Instagrapi ({media_type})",
     "instagrapi_fail": "⚠️ Failed to download from Instagram.",
     "reddit_json": "👽 Native API (Images)",
     "reddit_json_fail": "⚠️ Failed to extract Reddit images.",
+    "reddit_unavailable": "⚠️ This Reddit post was removed or is unavailable. Its media could not be downloaded.",
     "reddit_playwright": "👽 Playwright (Images)",
     "reddit_playwright_fail": "⚠️ Failed to extract Reddit images.",
-    "reddit_link_card": "🔗 External link (news)",
     "threads_playwright": "🧵 Playwright Threads ({media_type})",
     "threads_text_only": "🧵 Threads (Text)",
     "threads_playwright_fail": "⚠️ Failed to extract Threads media.",
+    "tiktok_playwright": "🎵 Playwright TikTok (Video)",
+    "tiktok_playwright_fail": "⚠️ Failed to extract the TikTok video.",
     "x": "🐦 X ({media_type}) [{count} files]",
     "x_text_only": "🐦 X (Text)",
     "x_fail": "⚠️ Failed to extract X media.",
@@ -112,6 +113,5 @@
     "original_lang_label": "ORIGINAL"
   },
 
-  "reactions": ["🔥", "⚡", "👀", "🗿", "👨‍💻"],
-  "reaction_ignored": "🙈"
+  "reactions": ["🔥", "⚡", "👀", "🗿", "👨‍💻"]
 }

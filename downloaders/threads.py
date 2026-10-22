@@ -16,23 +16,11 @@ logger = logging.getLogger(__name__)
 
 _POST_CODE_RE = re.compile(r"/post/([^/?#]+)")
 _SCRIPT_RE = re.compile(r"<script[^>]*>(.*?)</script>", re.DOTALL)
-_OG_URL_RE = re.compile(r'<meta[^>]+property="og:url"[^>]+content="([^"]+)"')
 
 
 def _extract_post_code(url: str) -> Optional[str]:
-    m = _POST_CODE_RE.search(url or "")
+    m = _POST_CODE_RE.search(url)
     return m.group(1) if m else None
-
-
-def _resolve_post_code(url: str, final_url: Optional[str], html: Optional[str]) -> Optional[str]:
-    code = _extract_post_code(url)
-    if code:
-        return code
-    code = _extract_post_code(final_url or "")
-    if code:
-        return code
-    m = _OG_URL_RE.search(html or "")
-    return _extract_post_code(m.group(1)) if m else None
 
 
 def _find_post_by_code(obj, code):
@@ -132,18 +120,18 @@ def _parse_post_from_html(html: str, code: str) -> Optional[dict]:
     return None
 
 
-async def _fetch_html(url: str) -> tuple[Optional[str], Optional[str]]:
+async def _fetch_html(url: str) -> Optional[str]:
     if not state.PW_CONTEXT:
-        return None, None
+        return None
     async with state.PW_SEMAPHORE:
         page = await state.PW_CONTEXT.new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=cfg("PW_GOTO_TIMEOUT_MS"))
             await page.wait_for_timeout(2000)
-            return await page.content(), page.url
+            return await page.content()
         except Exception as e:
             logger.warning(lmsg("threads.playwright_erro_carregando", arg0=safe_url(url), e=e))
-            return None, None
+            return None
         finally:
             await page.close()
 
@@ -157,13 +145,13 @@ async def download_threads(url: str, unique_folder: str) -> tuple[list[str], str
     if not state.PW_BROWSER or not state.PW_CONTEXT:
         return [], msg("downloader_status.playwright_not_running"), "", ""
 
-    html, final_url = await _fetch_html(url)
-    if not html:
-        return [], msg("downloader_status.threads_playwright_fail"), "", ""
-
-    code = _resolve_post_code(url, final_url, html)
+    code = _extract_post_code(url)
     if not code:
         logger.warning(lmsg("threads.n_o_consegui_extrair", arg0=safe_url(url)))
+        return [], msg("downloader_status.threads_playwright_fail"), "", ""
+
+    html = await _fetch_html(url)
+    if not html:
         return [], msg("downloader_status.threads_playwright_fail"), "", ""
 
     post = _parse_post_from_html(html, code)

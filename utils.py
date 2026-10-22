@@ -7,6 +7,7 @@ from typing import Any, Optional
 from urllib.parse import urlparse, urlunparse
 
 import aiofiles
+import aiohttp
 from PIL import Image
 from telegram.error import RetryAfter
 
@@ -82,8 +83,13 @@ def is_ignored_domain(url: str, ignored: Any) -> bool:
     return False
 
 
-def normalize_image(filepath: str, min_size: int = 50, quality: int = 95) -> Optional[str]:
+def normalize_image(filepath: str, min_size: int = 50, quality: int = 92) -> Optional[str]:
+    """Normalize image format & compress oversized images (>8MB or >4000px) for fast upload."""
     try:
+        if not os.path.exists(filepath):
+            return None
+        file_size = os.path.getsize(filepath)
+
         with Image.open(filepath) as img:
             width, height = img.size
             if width < min_size or height < min_size:
@@ -91,20 +97,29 @@ def normalize_image(filepath: str, min_size: int = 50, quality: int = 95) -> Opt
                     "utils.skip_image_too_small",
                     width=width, height=height, min_size=min_size, filepath=filepath,
                 ))
-                try:
-                    os.remove(filepath)
-                except OSError:
-                    pass
-                return None
+            is_heavy = file_size > 8 * 1024 * 1024 or width > 4000 or height > 4000
+            needs_convert = img.format in ('WEBP', 'TIFF') or img.mode in ('RGBA', 'P', 'LA', 'CMYK') or is_heavy
 
-            needs_convert = img.format in ('WEBP', 'TIFF') or img.mode in ('RGBA', 'P', 'LA', 'CMYK')
-            if not needs_convert:
+            if width >= min_size and height >= min_size and not needs_convert:
                 return filepath
 
-            rgb_im = img.convert('RGB')
+            if width >= min_size and height >= min_size:
+                # Resize if dimensions exceed 3840px (4K max)
+                if width > 3840 or height > 3840:
+                    img.thumbnail((3840, 3840), Image.Resampling.LANCZOS)
+
+                rgb_im = img.convert('RGB')
+
+        if width < min_size or height < min_size:
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+            return None
 
         new_filepath = filepath.rsplit('.', 1)[0] + '.jpg'
-        rgb_im.save(new_filepath, 'JPEG', quality=quality)
+        rgb_im.save(new_filepath, 'JPEG', quality=quality, optimize=True)
+
         if filepath != new_filepath:
             try:
                 os.remove(filepath)
@@ -112,9 +127,13 @@ def normalize_image(filepath: str, min_size: int = 50, quality: int = 95) -> Opt
                 pass
         return new_filepath
     except Exception as e:
-        logger.debug(lmsg("utils.normalize_image_falhou", filepath=filepath, e=e))
+        # Never return bytes that Pillow could not identify as an image. The
+        # old behavior passed HTML/SVG/error pages to send_photo and caused an
+        # entire Telegram album to fail with image_process_failed.
+        logger.warning(lmsg("utils.normalize_image_falhou", e=e, filepath=filepath))
         try:
-            os.remove(filepath)
+            if os.path.exists(filepath):
+                os.remove(filepath)
         except OSError:
             pass
         return None
@@ -149,8 +168,13 @@ async def async_download_file(
 ):
     """Baixa via aiohttp. Se return_content_type=True, retorna (ok, content_type)."""
     ct = ''
+    owned_session = None
     try:
-        async with state.AIOHTTP_SESSION.get(
+        session = state.AIOHTTP_SESSION
+        if session is None:
+            owned_session = aiohttp.ClientSession()
+            session = owned_session
+        async with session.get(
             url, timeout=cfg("DOWNLOAD_TIMEOUT_SECONDS"), headers=headers,
         ) as response:
             ct = (response.headers.get('Content-Type') or '').lower()
@@ -159,8 +183,29 @@ async def async_download_file(
                     logger.warning(lmsg("utils.skip_content_type", ct=ct, url=url))
                     return (False, ct) if return_content_type else False
 
+                max_bytes = max(1, int(cfg("TELEGRAM_MAX_UPLOAD_MB"))) * 1024 * 1024
+                declared_size = response.content_length
+                if declared_size is not None and declared_size > max_bytes:
+                    logger.warning(
+                        "Download ignorado: Content-Length %s excede o limite de %s bytes (%s)",
+                        declared_size, max_bytes, safe_url(url),
+                    )
+                    return (False, ct) if return_content_type else False
+
+                downloaded = 0
                 async with aiofiles.open(filepath, 'wb') as f:
                     async for chunk in response.content.iter_chunked(DOWNLOAD_CHUNK_SIZE):
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            logger.warning(
+                                "Download interrompido após exceder %s bytes (%s)",
+                                max_bytes, safe_url(url),
+                            )
+                            try:
+                                os.remove(filepath)
+                            except OSError:
+                                pass
+                            return (False, ct) if return_content_type else False
                         await f.write(chunk)
 
                 try:
@@ -175,7 +220,15 @@ async def async_download_file(
             return (False, ct) if return_content_type else False
     except Exception as e:
         logger.warning(lmsg("utils.erro_no_aiohttp", url=url, e=e))
-    return (False, ct) if return_content_type else False
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except OSError:
+            pass
+        return (False, ct) if return_content_type else False
+    finally:
+        if owned_session is not None:
+            await owned_session.close()
 
 
 async def async_download_via_playwright(
@@ -191,7 +244,7 @@ async def async_download_via_playwright(
         return False
     headers = {'Referer': referer} if referer else None
     try:
-        resp = await state.PW_CONTEXT.request.get(url, headers=headers)
+        resp = await state.PW_CONTEXT.request.get(url, headers=headers, timeout=15000)
     except Exception as e:
         logger.warning(lmsg("utils.erro_pw_request", e=e))
         return False
@@ -216,58 +269,39 @@ async def async_download_via_playwright(
             pass
 
 
-async def _run_proc(
-    cmd: list[str], timeout: int, capture_stdout: bool = False,
-) -> tuple[str, bytes, Any]:
-    """Roda cmd e espera. Retorna (status, stdout, detalhe) com status em
-    ok | fail (returncode != 0) | timeout | error. detalhe é o stderr decodificado,
-    ou a exceção no caso 'error'."""
+async def async_gif_to_mp4(input_path: str, output_path: str, timeout: int = 60) -> bool:
     process = None
+    ffmpeg_bin = state.FFMPEG_PATH or 'ffmpeg'
     try:
+        cmd = [
+            ffmpeg_bin, '-y', '-i', input_path,
+            '-movflags', '+faststart',
+            '-pix_fmt', 'yuv420p',
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+            '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+            output_path,
+        ]
         process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE if capture_stdout else asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        detail = (stderr or b'').decode('utf-8', errors='ignore')
-        return ('ok' if process.returncode == 0 else 'fail'), (stdout or b''), detail
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        if process.returncode != 0:
+            err = stderr.decode('utf-8', errors='ignore')
+            logger.warning(lmsg("utils.gif_to_mp4_falhou", arg0=err[-400:]))
+            return False
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
     except asyncio.TimeoutError:
+        logger.warning(lmsg("utils.gif_to_mp4_timeout", timeout=timeout, input_path=input_path))
         if process:
             try:
                 process.kill()
                 await process.wait()
             except Exception:
                 pass
-        return 'timeout', b'', ''
+        return False
     except Exception as e:
-        return 'error', b'', e
-
-
-def _nonempty(path: str) -> bool:
-    return os.path.exists(path) and os.path.getsize(path) > 0
-
-
-async def async_gif_to_mp4(input_path: str, output_path: str, timeout: int = 60) -> bool:
-    cmd = [
-        state.FFMPEG_PATH or 'ffmpeg', '-y', '-i', input_path,
-        '-movflags', '+faststart',
-        '-pix_fmt', 'yuv420p',
-        '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
-        '-an', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-        output_path,
-    ]
-    status, _, detail = await _run_proc(cmd, timeout)
-    if status == 'timeout':
-        logger.warning(lmsg("utils.gif_to_mp4_timeout", timeout=timeout, input_path=input_path))
+        logger.warning(lmsg("utils.gif_to_mp4_erro", e=e), exc_info=True)
         return False
-    if status == 'error':
-        logger.warning(lmsg("utils.gif_to_mp4_erro", e=detail), exc_info=detail)
-        return False
-    if status == 'fail':
-        logger.warning(lmsg("utils.gif_to_mp4_falhou", arg0=detail[-400:]))
-        return False
-    return _nonempty(output_path)
 
 
 _TG_COMPATIBLE_VIDEO_EXTS = ('.mp4', '.m4v', '.mov')
@@ -279,133 +313,175 @@ def is_telegram_compatible_video_ext(filepath: str) -> bool:
     return filepath.lower().endswith(_TG_COMPATIBLE_VIDEO_EXTS)
 
 
-def _ffprobe_fields(stdout: bytes) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
-    for line in stdout.decode('utf-8', errors='ignore').splitlines():
-        if '=' in line:
-            k, v = line.split('=', 1)
-            out.append((k.strip(), v.strip()))
-    return out
-
-
 async def async_ffprobe_codecs(filepath: str, timeout: int = 30) -> tuple[Optional[str], Optional[str]]:
-    if not state.FFPROBE_PATH:
+    started = time.monotonic()
+    ffprobe_bin = state.FFPROBE_PATH
+    if not ffprobe_bin:
         return None, None
-    cmd = [
-        state.FFPROBE_PATH, '-v', 'error',
-        '-show_entries', 'stream=codec_type,codec_name',
-        '-of', 'default=nw=1',
-        filepath,
-    ]
-    status, stdout, detail = await _run_proc(cmd, timeout, capture_stdout=True)
-    if status == 'timeout':
-        logger.warning(lmsg("utils.ffprobe_timeout", timeout=timeout, filepath=filepath))
-        return None, None
-    if status == 'error':
-        logger.warning(lmsg("utils.ffprobe_erro", e=detail))
-        return None, None
-    if status == 'fail':
-        logger.warning(lmsg("utils.ffprobe_falhou", arg0=detail[-200:]))
-        return None, None
-
-    vcodec: Optional[str] = None
-    acodec: str = ''
-    cur_type: Optional[str] = None
-    cur_name: Optional[str] = None
-    for k, v in _ffprobe_fields(stdout):
-        v = v.lower()
-        if k == 'codec_type':
-            cur_type = v
-        elif k == 'codec_name':
-            cur_name = v
-        if cur_type and cur_name:
-            if cur_type == 'video' and vcodec is None:
-                vcodec = cur_name
-            elif cur_type == 'audio' and not acodec:
-                acodec = cur_name
-            cur_type = cur_name = None
-    return vcodec, acodec
-
-
-async def async_ffprobe_video_meta(filepath: str, timeout: int = 30) -> tuple[Optional[int], Optional[int], Optional[int]]:
-    """Retorna (width, height, duration_seg) do 1º stream de vídeo — o Bot API local
-    NÃO auto-detecta esses metadados, e sem eles o cliente do Telegram às vezes não
-    monta o player ('não foi possível reproduzir, use player externo')."""
-    if not state.FFPROBE_PATH:
-        return None, None, None
-    cmd = [
-        state.FFPROBE_PATH, '-v', 'error',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=width,height:format=duration',
-        '-of', 'default=nw=1',
-        filepath,
-    ]
-    status, stdout, detail = await _run_proc(cmd, timeout, capture_stdout=True)
-    if status == 'error':
-        logger.warning(lmsg("utils.ffprobe_erro", e=detail))
-    if status != 'ok':
-        return None, None, None
-
-    meta: dict[str, int] = {}
-    for k, v in _ffprobe_fields(stdout):
-        if k in ('width', 'height', 'duration') and v and v != 'N/A':
-            try:
-                meta[k] = int(float(v))
-            except ValueError:
+    process = None
+    try:
+        cmd = [
+            ffprobe_bin, '-v', 'error',
+            '-show_entries', 'stream=codec_type,codec_name',
+            '-of', 'default=nw=1',
+            filepath,
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        if process.returncode != 0:
+            err = stderr.decode('utf-8', errors='ignore')
+            logger.warning(lmsg("utils.ffprobe_falhou", arg0=err[-200:]))
+            return None, None
+        vcodec: Optional[str] = None
+        acodec: str = ''
+        cur_type: Optional[str] = None
+        cur_name: Optional[str] = None
+        for line in stdout.decode('utf-8', errors='ignore').splitlines():
+            if '=' not in line:
                 continue
-    return meta.get('width'), meta.get('height'), meta.get('duration')
+            k, v = line.split('=', 1)
+            k, v = k.strip(), v.strip().lower()
+            if k == 'codec_type':
+                cur_type = v
+            elif k == 'codec_name':
+                cur_name = v
+            if cur_type and cur_name:
+                if cur_type == 'video' and vcodec is None:
+                    vcodec = cur_name
+                elif cur_type == 'audio' and not acodec:
+                    acodec = cur_name
+                cur_type = cur_name = None
+        logger.info(
+            "pipeline stage=ffprobe outcome=ok elapsed_ms=%d size_bytes=%s vcodec=%s acodec=%s",
+            round((time.monotonic() - started) * 1000),
+            os.path.getsize(filepath) if os.path.exists(filepath) else "na",
+            vcodec or "unknown",
+            acodec or "none",
+        )
+        return vcodec, acodec
+    except asyncio.TimeoutError:
+        logger.warning(lmsg("utils.ffprobe_timeout", timeout=timeout, filepath="<redacted>"))
+        if process:
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
+        return None, None
+    except Exception as e:
+        logger.warning(lmsg("utils.ffprobe_erro", e=e))
+        return None, None
 
 
 async def async_ensure_telegram_video(filepath: str, timeout: int = 600) -> Optional[str]:
-    ext_ok = is_telegram_compatible_video_ext(filepath)
+    conversion_started = time.monotonic()
+    input_size = os.path.getsize(filepath) if os.path.exists(filepath) else None
+    container_compatible = is_telegram_compatible_video_ext(filepath)
 
-    if not state.FFMPEG_PATH:
-        if ext_ok:
-            return filepath
-        logger.warning(lmsg("utils.video_convert_no_ffmpeg", filepath=filepath))
-        return None
-
+    # An MP4/MOV extension alone does not guarantee Telegram compatibility:
+    # yt-dlp can put AV1 or HEVC video in MP4.  Probe when possible and only
+    # pass through H.264 with AAC (or no audio).
+    if not state.FFPROBE_PATH and container_compatible:
+        return filepath
     vcodec, acodec = await async_ffprobe_codecs(filepath)
-    if vcodec is None:
-        return filepath if ext_ok else None
-
-    v_ok = vcodec in _TG_COMPATIBLE_VCODECS
-    a_ok = (acodec == '') or (acodec in _TG_COMPATIBLE_ACODECS)
-    if ext_ok and v_ok and a_ok:
+    if (
+        container_compatible
+        and vcodec in _TG_COMPATIBLE_VCODECS
+        and (acodec == '' or acodec in _TG_COMPATIBLE_ACODECS)
+    ):
         return filepath
 
+    if not state.FFMPEG_PATH:
+        logger.warning(lmsg("utils.video_convert_no_ffmpeg", filepath="<redacted>"))
+        return None
+
     out_path = os.path.splitext(filepath)[0] + '.tg.mp4'
-    reencode = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p']
+
+    if vcodec in _TG_COMPATIBLE_VCODECS:
+        v_args = ['-c:v', 'copy']
+    else:
+        v_args = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p']
 
     if acodec == '':
         a_args = ['-an']
-    elif a_ok:
+    elif acodec in _TG_COMPATIBLE_ACODECS:
         a_args = ['-c:a', 'copy']
     else:
         a_args = ['-c:a', 'aac', '-b:a', '192k']
 
-    # copy do vídeo primeiro; se falhar, re-encoda
-    for attempt, v_args in enumerate([['-c:v', 'copy'], reencode] if v_ok else [reencode]):
-        if attempt:
-            logger.info(lmsg("utils.video_convert_retry_reencode", filepath=filepath))
-        else:
-            logger.info(lmsg(
-                "utils.video_convert_iniciando",
-                filepath=filepath, vcodec=vcodec or 'unknown', acodec=acodec or 'none',
-                v_args=' '.join(v_args), a_args=' '.join(a_args),
-            ))
-        cmd = [state.FFMPEG_PATH, '-y', '-i', filepath, *v_args, *a_args, '-movflags', '+faststart', out_path]
-        status, _, detail = await _run_proc(cmd, timeout)
-        if status == 'ok' and _nonempty(out_path):
-            logger.info(lmsg("utils.video_convert_ok", out_path=out_path))
-            return out_path
-        if status == 'timeout':
-            logger.warning(lmsg("utils.video_convert_timeout", timeout=timeout, filepath=filepath))
-        elif status == 'error':
-            logger.warning(lmsg("utils.video_convert_erro", e=detail))
-        else:
-            logger.warning(lmsg("utils.video_convert_falhou", arg0=detail[-400:]))
+    cmd = [state.FFMPEG_PATH, '-y', '-i', filepath, *v_args, *a_args, '-movflags', '+faststart', out_path]
+    logger.info(lmsg(
+        "utils.video_convert_iniciando",
+        filepath="<redacted>", vcodec=vcodec or 'unknown', acodec=acodec or 'none',
+        v_args=' '.join(v_args), a_args=' '.join(a_args),
+    ))
 
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        if process.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            logger.info(lmsg("utils.video_convert_ok", out_path="<redacted>"))
+            logger.info(
+                "pipeline stage=transcode outcome=ok elapsed_ms=%d input_bytes=%s output_bytes=%d",
+                round((time.monotonic() - conversion_started) * 1000), input_size or "na", os.path.getsize(out_path),
+            )
+            return out_path
+        err = stderr.decode('utf-8', errors='ignore')
+        logger.warning(lmsg("utils.video_convert_falhou", arg0=err[-400:]))
+    except asyncio.TimeoutError:
+        logger.warning(lmsg("utils.video_convert_timeout", timeout=timeout, filepath="<redacted>"))
+        if process:
+            try:
+                process.kill()
+                await process.wait()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(lmsg("utils.video_convert_erro", e=e))
+
+    if 'copy' in v_args:
+        logger.info(lmsg("utils.video_convert_retry_reencode", filepath="<redacted>"))
+        cmd_retry = [
+            state.FFMPEG_PATH, '-y', '-i', filepath,
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p',
+            *a_args, '-movflags', '+faststart', out_path,
+        ]
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *cmd_retry, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+            )
+            elapsed = time.monotonic() - conversion_started
+            remaining_timeout = max(1.0, timeout - elapsed)
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=remaining_timeout)
+            if process.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                logger.info(lmsg("utils.video_convert_ok", out_path="<redacted>"))
+                logger.info(
+                    "pipeline stage=transcode_retry outcome=ok elapsed_ms=%d input_bytes=%s output_bytes=%d",
+                    round((time.monotonic() - conversion_started) * 1000), input_size or "na", os.path.getsize(out_path),
+                )
+                return out_path
+            err = stderr.decode('utf-8', errors='ignore')
+            logger.warning(lmsg("utils.video_convert_falhou", arg0=err[-400:]))
+        except asyncio.TimeoutError:
+            logger.warning(lmsg("utils.video_convert_timeout", timeout=timeout, filepath="<redacted>"))
+            if process:
+                try:
+                    process.kill()
+                    await process.wait()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(lmsg("utils.video_convert_erro", e=e))
+
+    logger.info(
+        "pipeline stage=transcode outcome=failed elapsed_ms=%d input_bytes=%s",
+        round((time.monotonic() - conversion_started) * 1000), input_size or "na",
+    )
     return None
 
 
@@ -416,27 +492,41 @@ async def async_ffmpeg_remux(
     headers: Optional[dict] = None,
 ) -> bool:
     """Mux HLS/DASH/qualquer URL stream pra mp4 via ffmpeg copy (sem re-encode)."""
-    cmd = [state.FFMPEG_PATH or 'ffmpeg', '-y']
-    if headers:
-        cmd.extend(['-headers', ''.join(f"{k}: {v}\r\n" for k, v in headers.items())])
-    cmd.extend([
-        '-i', input_url,
-        '-c', 'copy',
-        '-bsf:a', 'aac_adtstoasc',
-        '-movflags', '+faststart',
-        output_path,
-    ])
-    status, _, detail = await _run_proc(cmd, timeout)
-    if status == 'timeout':
+    process = None
+    ffmpeg_bin = state.FFMPEG_PATH or 'ffmpeg'
+    try:
+        cmd = [ffmpeg_bin, '-y']
+        if headers:
+            header_blob = ''.join(f"{k}: {v}\r\n" for k, v in headers.items())
+            cmd.extend(['-headers', header_blob])
+        cmd.extend([
+            '-i', input_url,
+            '-c', 'copy',
+            '-bsf:a', 'aac_adtstoasc',
+            '-movflags', '+faststart',
+            output_path,
+        ])
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        if process.returncode != 0:
+            err = stderr.decode('utf-8', errors='ignore')
+            logger.warning(lmsg("utils.ffmpeg_remux_falhou", arg0=err[-400:]))
+            return False
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except asyncio.TimeoutError:
         logger.warning(lmsg("utils.ffmpeg_remux_timeout", timeout=timeout, input_url=input_url))
+        try:
+            if process:
+                process.kill()
+                await process.wait()
+        except Exception:
+            pass
         return False
-    if status == 'error':
-        logger.warning(lmsg("utils.erro_fatal_no", e=detail), exc_info=detail)
+    except Exception as e:
+        logger.warning(lmsg("utils.erro_fatal_no", e=e), exc_info=True)
         return False
-    if status == 'fail':
-        logger.warning(lmsg("utils.ffmpeg_remux_falhou", arg0=detail[-400:]))
-        return False
-    return _nonempty(output_path)
 
 
 async def async_merge_audio_image(
@@ -446,42 +536,114 @@ async def async_merge_audio_image(
     start_time: Optional[float] = None,
     duration: Optional[float] = None,
 ) -> bool:
-    cmd = [state.FFMPEG_PATH or 'ffmpeg', '-y', '-loop', '1', '-framerate', '15', '-i', image_path]
-    if start_time is not None:
-        cmd.extend(['-ss', str(start_time)])
-    cmd.extend(['-i', audio_path, '-map', '0:v:0', '-map', '1:a:0'])
-    if duration is not None:
-        cmd.extend(['-t', str(duration)])
-    cmd.extend([
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
-        '-r', '15',
-        '-c:a', 'aac', '-b:a', '192k',
-        '-vf', "scale='min(1280,iw)':'min(1280,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-        '-pix_fmt', 'yuv420p', '-shortest',
-        '-movflags', '+faststart',
-        output_path,
-    ])
+    process = None
+    ffmpeg_bin = state.FFMPEG_PATH or 'ffmpeg'
+    try:
+        cmd = [ffmpeg_bin, '-y', '-loop', '1', '-framerate', '1', '-i', image_path]
 
-    status, _, detail = await _run_proc(cmd, 180)
-    if status == 'timeout':
+        if start_time is not None:
+            cmd.extend(['-ss', str(start_time)])
+
+        cmd.extend(['-i', audio_path])
+        cmd.extend(['-map', '0:v:0', '-map', '1:a:0'])
+
+        if duration is not None:
+            cmd.extend(['-t', str(duration)])
+
+        cmd.extend([
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage',
+            '-c:a', 'aac', '-b:a', '192k',
+            '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+            '-pix_fmt', 'yuv420p', '-shortest',
+            output_path
+        ])
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60)
+
+        if process.returncode != 0:
+            err_msg = stderr.decode('utf-8', errors='ignore')
+            logger.error(lmsg("utils.erro_ffmpeg_x", err_msg=err_msg))
+            return False
+
+        return True
+    except asyncio.TimeoutError:
         logger.error(lmsg("utils.ffmpeg_travou_e"))
+        try:
+            if process:
+                process.kill()
+                await process.wait()
+        except Exception:
+            pass
         return False
-    if status == 'error':
-        logger.error(lmsg("utils.erro_fatal_no_2", e=detail), exc_info=detail)
+    except Exception as e:
+        logger.error(lmsg("utils.erro_fatal_no_2", e=e), exc_info=True)
         return False
-    if status == 'fail':
-        logger.error(lmsg("utils.erro_ffmpeg_x", err_msg=detail))
-        return False
-    return True
+
+
+
+def render_progress_bar(pct: float, speed_bytes: float = 0.0, eta_s: int = 0, title: str = "Baixando Mídia") -> str:
+    """Render a clean Telegram-formatted visual progress bar."""
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 5.0))
+    bar = "█" * filled + "░" * (20 - filled)
+
+    speed_mb = speed_bytes / (1024 * 1024) if speed_bytes > 0 else 0.0
+    speed_str = f"{speed_mb:.1f} MB/s" if speed_mb > 0 else ""
+    eta_str = f"{eta_s // 60:02d}:{eta_s % 60:02d}" if eta_s > 0 else ""
+
+    details = []
+    if speed_str:
+        details.append(f"⚡ {speed_str}")
+    if eta_str:
+        details.append(f"⏱ {eta_str}")
+
+    detail_line = (" • ".join(details)) if details else "⏳ Processando mídia..."
+
+    return (
+        f"📥 <b>{title}</b>\n"
+        f"<code>[{bar}]</code> <b>{pct:.1f}%</b>\n"
+        f"{detail_line}"
+    )
 
 
 async def cycle_status_message(status_msg: Any, suffix: str = "") -> None:
-    messages = [m.format(suffix=suffix) for m in msg_list("status_cycle")]
-    idx = 1 % len(messages)
+    """Dynamic animated progress bar status message for all downloads."""
+    frames = [
+        "<code>[█░░░░░░░░░░░░░░░░░░░]</code>",
+        "<code>[███░░░░░░░░░░░░░░░░░]</code>",
+        "<code>[██████░░░░░░░░░░░░░░]</code>",
+        "<code>[█████████░░░░░░░░░░░]</code>",
+        "<code>[████████████░░░░░░░░]</code>",
+        "<code>[███████████████░░░░░]</code>",
+        "<code>[██████████████████░░]</code>",
+        "<code>[████████████████████]</code>",
+    ]
+
+    stages = [
+        "🔍 <b>Analisando link e mídias...</b>",
+        "📥 <b>Baixando conteúdo em alta qualidade...</b>",
+        "⚙️ <b>Processando formatos e faixas...</b>",
+        "📤 <b>Preparando envio no Telegram...</b>",
+    ]
+
+    idx = 0
+    stage_idx = 0
     try:
         while True:
+            frame = frames[idx % len(frames)]
+            stage_text = stages[stage_idx % len(stages)]
+
+            if suffix:
+                text = f"{stage_text}\n{frame}\n<i>{suffix}</i>"
+            else:
+                text = f"{stage_text}\n{frame}"
+
             try:
-                await status_msg.edit_text(messages[idx])
+                await status_msg.edit_text(text, parse_mode="HTML")
             except RetryAfter as e:
                 await asyncio.sleep(e.retry_after)
                 continue
@@ -489,7 +651,19 @@ async def cycle_status_message(status_msg: Any, suffix: str = "") -> None:
                 err_msg = str(str_err).lower()
                 if "not found" in err_msg or "deleted" in err_msg or "message to edit not found" in err_msg:
                     break
-            await asyncio.sleep(cfg("STATUS_CYCLE_INTERVAL"))
-            idx = (idx + 1) % len(messages)
+
+            await asyncio.sleep(1.8)
+            idx += 1
+            if idx % 3 == 0:
+                stage_idx = (stage_idx + 1) % len(stages)
     except asyncio.CancelledError:
         pass
+
+
+def safe_chmod(path: str, mode: int) -> None:
+    """Safely apply os.chmod without raising PermissionError or OSError."""
+    try:
+        if os.path.exists(path):
+            os.chmod(path, mode)
+    except (PermissionError, OSError) as e:
+        logger.debug(f"safe_chmod permissão ignorada para {path}: {e}")

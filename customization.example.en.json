@@ -63,8 +63,8 @@
     "_doc_YTDLP_SOCKET_TIMEOUT": "yt-dlp socket timeout (seconds) when downloading from any platform. Min 30, max 600.",
     "YTDLP_SOCKET_TIMEOUT": 90,
 
-    "_doc_YTDLP_YT_CLIENTS": "CSV list of YouTube extractor clients (yt-dlp). \"default\" lets yt-dlp pick the best working set (recommended). Tweak if YouTube breaks.",
-    "YTDLP_YT_CLIENTS": "default",
+    "_doc_YTDLP_YT_CLIENTS": "CSV list of YouTube extractor clients (yt-dlp), in attempt order. Common: \"ios,mweb,web\". Tweak if YouTube breaks.",
+    "YTDLP_YT_CLIENTS": "ios,mweb,web",
 
     "_doc_DOWNLOAD_TIMEOUT_SECONDS": "Per-file timeout (seconds) for individual aiohttp downloads (outside yt-dlp). Min 5, max 120.",
     "DOWNLOAD_TIMEOUT_SECONDS": 15,

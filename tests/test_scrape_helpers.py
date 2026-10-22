@@ -249,6 +249,29 @@ def test_extract_article_returns_title_and_body():
     title, body = result
     assert "Notícia importante" in title
     assert "primeiro parágrafo" in body
+    assert "\n\nEste é o segundo parágrafo" in body
+    assert "\n\nTerceiro parágrafo" in body
+
+
+def test_format_article_body_separates_paragraphs_and_groups_lists():
+    from downloaders._scrape_helpers import _format_article_body
+
+    raw = (
+        "Introdução da matéria.\r\n"
+        "\r\n"
+        "Primeiro parágrafo.\n"
+        "- Primeiro item\n"
+        "- Segundo item\n"
+        "Conclusão."
+    )
+
+    assert _format_article_body(raw) == (
+        "Introdução da matéria.\n\n"
+        "Primeiro parágrafo.\n\n"
+        "- Primeiro item\n"
+        "- Segundo item\n\n"
+        "Conclusão."
+    )
 
 
 def test_extract_article_returns_none_for_short_content():

@@ -1,15 +1,13 @@
 import html
 import re
-from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from ._caption import _build_caption
-from ._platform import _bare_host, _host_matches
 
 
 _REDDIT_MEDIA_HOSTS = ('i.redd.it', 'preview.redd.it')
 _REDDIT_JUNK_MARKERS = ('award_images', 'snoovatar', 'avatars', 'icon')
 _IMG_EXT_RE = re.compile(r'\.(jpg|jpeg|png|webp|gif)($|\?)', re.IGNORECASE)
-_REDDIT_NATIVE_HOSTS = ('reddit.com', 'redd.it', 'i.redd.it', 'v.redd.it', 'preview.redd.it')
 
 
 def build_reddit_caption(title: str, selftext: str, url: str) -> tuple[str, str]:
@@ -20,8 +18,21 @@ def build_reddit_caption(title: str, selftext: str, url: str) -> tuple[str, str]
 def clean_reddit_media_url(raw_url: str) -> str | None:
     if not raw_url:
         return None
-    cleaned = html.unescape(raw_url).split('?')[0]
-    return cleaned.replace('preview.redd.it', 'i.redd.it')
+    cleaned = html.unescape(raw_url)
+    parsed = urlsplit(cleaned)
+    host = (parsed.hostname or "").lower()
+
+    if host == "preview.redd.it":
+        parsed = parsed._replace(netloc="i.redd.it", query="", fragment="")
+    elif host == "i.redd.it":
+        parsed = parsed._replace(query="", fragment="")
+    else:
+        # External preview URLs use a signed query string. Rewriting the
+        # substring in external-preview.redd.it creates the nonexistent
+        # external-i.redd.it host and removing the query invalidates the URL.
+        parsed = parsed._replace(fragment="")
+
+    return urlunsplit(parsed)
 
 
 def is_reddit_media_url(url: str) -> bool:
@@ -37,43 +48,3 @@ def is_reddit_media_url(url: str) -> bool:
 
 def looks_like_image(url: str) -> bool:
     return bool(_IMG_EXT_RE.search(url or ''))
-
-
-def reddit_external_link(post_data: dict) -> Optional[dict]:
-    """Se o post for um link externo (notícia/YouTube/etc.), retorna
-    {external_url, title, thumbnail_url}. Retorna None quando o post é mídia
-    nativa do Reddit (imagem/galeria/vídeo) ou texto — nesses casos o fluxo
-    normal cuida."""
-    if not isinstance(post_data, dict):
-        return None
-    if post_data.get('is_self'):
-        return None
-    if post_data.get('is_video') or post_data.get('post_hint') == 'hosted:video':
-        return None
-    if 'media_metadata' in post_data:
-        return None
-
-    dest = post_data.get('url_overridden_by_dest') or post_data.get('url') or ''
-    if not dest:
-        return None
-
-    domain = (post_data.get('domain') or '').lower()
-    if domain.startswith('self.'):
-        return None
-
-    if _host_matches(_bare_host(dest), _REDDIT_NATIVE_HOSTS):
-        return None
-    if looks_like_image(dest):
-        return None
-
-    thumbnail_url = None
-    images = (post_data.get('preview') or {}).get('images') or []
-    if images:
-        raw = (images[0].get('source') or {}).get('url') or ''
-        thumbnail_url = html.unescape(raw) or None
-
-    return {
-        'external_url': dest,
-        'title': post_data.get('title') or '',
-        'thumbnail_url': thumbnail_url,
-    }

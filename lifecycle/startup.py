@@ -2,12 +2,14 @@ import asyncio
 import logging
 import os
 import shutil
+import time
 
 import state
 from config import BASE_DOWNLOAD_DIR
 from messages import lmsg
 
 logger = logging.getLogger(__name__)
+STARTUP_FOLDER_MIN_AGE_SECONDS = 1800
 
 
 def init_deno() -> None:
@@ -51,7 +53,14 @@ def _sync_startup_cleanup() -> None:
     try:
         for item in os.listdir(folder):
             item_path = os.path.join(folder, item)
-            if os.path.isdir(item_path) and item.startswith("task_"):
+            if (
+                os.path.isdir(item_path)
+                and item.startswith("task_")
+                and os.path.realpath(item_path) not in {
+                    os.path.realpath(path) for path in state.active_download_folders
+                }
+                and time.time() - os.path.getmtime(item_path) > STARTUP_FOLDER_MIN_AGE_SECONDS
+            ):
                 shutil.rmtree(item_path)
         logger.info(lmsg("startup.limpeza_inicial_pastas"))
     except Exception as e:

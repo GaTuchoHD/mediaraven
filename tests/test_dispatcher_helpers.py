@@ -2,13 +2,19 @@
 import os
 from pathlib import Path
 
-from downloaders._caption import _build_caption
-from downloaders._languages import _build_lang_buttons, _parse_lang_from_format
-from downloaders._platform import Platform, _detect_platform, _normalize_youtube_url
-from downloaders._ytdlp import (
+import pytest
+
+from downloaders import _platform
+from downloaders.dispatcher import (
+    Platform,
     _apply_format_selection,
     _attempt_order,
+    _build_caption,
+    _build_lang_buttons,
+    _detect_platform,
     _list_downloaded_files,
+    _normalize_youtube_url,
+    _parse_lang_from_format,
     _wipe_folder,
 )
 
@@ -24,10 +30,88 @@ def test_detect_platform_reddit_short_and_full():
     assert _detect_platform("https://redd.it/xyz").reddit is True
 
 
+class _RedirectResponse:
+    def __init__(self, url: str):
+        self.url = url
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _RedirectSession:
+    def __init__(self, url: str):
+        self.url = url
+
+    def get(self, *_args, **_kwargs):
+        return _RedirectResponse(self.url)
+
+
+@pytest.mark.asyncio
+async def test_resolve_threads_share_url_accepts_canonical_post(monkeypatch):
+    short_url = "https://www.threads.com/share/BAtUhNV5sV/"
+    resolved_url = "https://www.threads.com/@moon_goddess3469/post/DbbXtDaFQO4?xmt=abc"
+    monkeypatch.setattr(_platform.state, "AIOHTTP_SESSION", _RedirectSession(resolved_url))
+
+    assert await _platform._resolve_threads_share_url(short_url) == resolved_url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resolved_url",
+    [
+        "https://evil.example/@moon/post/DbbXtDaFQO4",
+        "https://www.threads.com/@moon_goddess3469/",
+    ],
+)
+async def test_resolve_threads_share_url_rejects_invalid_destination(monkeypatch, resolved_url):
+    short_url = "https://www.threads.com/share/BAtUhNV5sV/"
+    monkeypatch.setattr(_platform.state, "AIOHTTP_SESSION", _RedirectSession(resolved_url))
+
+    assert await _platform._resolve_threads_share_url(short_url) == short_url
+
+
+@pytest.mark.asyncio
+async def test_resolve_threads_share_url_keeps_direct_post(monkeypatch):
+    direct_url = "https://www.threads.com/@carla_souza.desa/post/DbbPKTxlLrG"
+    monkeypatch.setattr(_platform.state, "AIOHTTP_SESSION", None)
+
+    assert await _platform._resolve_threads_share_url(direct_url) == direct_url
+
+
+@pytest.mark.asyncio
+async def test_resolve_short_reddit_url_keeps_token_when_redirect_loses_post(monkeypatch):
+    short_url = "https://www.reddit.com/r/InfernoSocial/s/wvEBHmvbYA"
+    monkeypatch.setattr(
+        _platform.state,
+        "AIOHTTP_SESSION",
+        _RedirectSession("https://www.reddit.com/r/InfernoSocial/"),
+    )
+
+    assert await _platform._resolve_short_reddit_url(short_url) == short_url
+
+
+@pytest.mark.asyncio
+async def test_resolve_short_reddit_url_accepts_resolved_post(monkeypatch):
+    short_url = "https://www.reddit.com/r/InfernoSocial/s/wvEBHmvbYA"
+    resolved_url = "https://www.reddit.com/r/InfernoSocial/comments/1vbnogx/post/"
+    monkeypatch.setattr(_platform.state, "AIOHTTP_SESSION", _RedirectSession(resolved_url))
+
+    assert await _platform._resolve_short_reddit_url(short_url) == resolved_url
+
+
 def test_detect_platform_threads_and_instagram():
     assert _detect_platform("https://www.threads.net/@user/post/1").threads is True
     assert _detect_platform("https://threads.com/@user/post/1").threads is True
     assert _detect_platform("https://www.instagram.com/p/abc/").instagram is True
+
+
+def test_detect_platform_urlebird():
+    assert _detect_platform("https://urlebird.com/video/example-123/").urlebird is True
+    assert _detect_platform("https://www.urlebird.com/video/example-123/").urlebird is True
+    assert _detect_platform("https://fakeurlebird.com/video/example-123/").urlebird is False
 
 
 def test_detect_platform_rejects_lookalike_domains():

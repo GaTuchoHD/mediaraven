@@ -62,104 +62,53 @@ async def test_ffprobe_no_audio_stream():
 
 
 @pytest.mark.asyncio
-async def test_ensure_video_passes_through_compatible_ext():
-    out = await utils.async_ensure_telegram_video("/x/clip.mp4")
+async def test_ensure_video_passes_through_h264_aac_mp4():
+    async def fake_probe(filepath, timeout=30):
+        return "h264", "aac"
+
+    with patch.object(state, "FFPROBE_PATH", "/usr/bin/ffprobe"), \
+         patch.object(utils, "async_ffprobe_codecs", fake_probe):
+        out = await utils.async_ensure_telegram_video("/x/clip.mp4")
     assert out == "/x/clip.mp4"
-    out = await utils.async_ensure_telegram_video("/x/clip.MOV")
+
+
+@pytest.mark.asyncio
+async def test_ensure_video_compatible_ext_without_ffprobe_preserves_old_behavior():
+    with patch.object(state, "FFPROBE_PATH", None):
+        out = await utils.async_ensure_telegram_video("/x/clip.MOV")
     assert out == "/x/clip.MOV"
 
 
 @pytest.mark.asyncio
-async def test_ensure_video_mp4_h264_aac_passes_through(tmp_path):
-    """.mp4 com codec compatível (h264+aac) não deve ser convertido."""
-    f = tmp_path / "clip.mp4"
-    f.write_bytes(b"x")
-    exec_called = {"n": 0}
-
-    async def fake_exec(*args, **kwargs):
-        exec_called["n"] += 1
-        return _fake_proc(0)
-
-    async def fake_probe(filepath, timeout=30):
-        return "h264", "aac"
-
-    with patch.object(state, "FFMPEG_PATH", "/usr/bin/ffmpeg"), \
-         patch.object(utils, "async_ffprobe_codecs", fake_probe), \
-         patch.object(asyncio, "create_subprocess_exec", fake_exec):
-        out = await utils.async_ensure_telegram_video(str(f))
-
-    assert out == str(f)
-    assert exec_called["n"] == 0
-
-
-@pytest.mark.asyncio
-async def test_ensure_video_mp4_with_av1_gets_reencoded(tmp_path):
-    """.mp4 com codec incompatível (av1) deve ser re-encodado apesar da extensão .mp4."""
+@pytest.mark.parametrize(
+    ("codec", "audio", "expected_audio_arg"),
+    [("av1", "aac", "copy"), ("hevc", "", "-an")],
+)
+async def test_ensure_video_reencodes_incompatible_codec_inside_mp4(
+    tmp_path, codec, audio, expected_audio_arg,
+):
     f = tmp_path / "clip.mp4"
     f.write_bytes(b"x")
     out_target = tmp_path / "clip.tg.mp4"
-    captured: list = []
+    captured_cmd: list = []
 
     async def fake_exec(*args, **kwargs):
-        captured.extend(args)
+        captured_cmd.extend(args)
         out_target.write_bytes(b"out")
         return _fake_proc(0)
 
     async def fake_probe(filepath, timeout=30):
-        return "av1", "aac"
+        return codec, audio
 
     with patch.object(state, "FFMPEG_PATH", "/usr/bin/ffmpeg"), \
+         patch.object(state, "FFPROBE_PATH", "/usr/bin/ffprobe"), \
          patch.object(utils, "async_ffprobe_codecs", fake_probe), \
          patch.object(asyncio, "create_subprocess_exec", fake_exec):
         out = await utils.async_ensure_telegram_video(str(f))
 
     assert out == str(out_target)
-    assert "libx264" in captured
-    assert "copy" in captured
-
-
-@pytest.mark.asyncio
-async def test_ensure_video_mp4_hevc_gets_reencoded(tmp_path):
-    """.mp4 HEVC (TikTok/bytevc1) deve ser re-encodado pra h264."""
-    f = tmp_path / "clip.mp4"
-    f.write_bytes(b"x")
-    out_target = tmp_path / "clip.tg.mp4"
-    captured: list = []
-
-    async def fake_exec(*args, **kwargs):
-        captured.extend(args)
-        out_target.write_bytes(b"out")
-        return _fake_proc(0)
-
-    async def fake_probe(filepath, timeout=30):
-        return "hevc", "aac"
-
-    with patch.object(state, "FFMPEG_PATH", "/usr/bin/ffmpeg"), \
-         patch.object(utils, "async_ffprobe_codecs", fake_probe), \
-         patch.object(asyncio, "create_subprocess_exec", fake_exec):
-        out = await utils.async_ensure_telegram_video(str(f))
-
-    assert out == str(out_target)
-    assert "libx264" in captured
-
-
-@pytest.mark.asyncio
-async def test_merge_audio_image_uses_normal_fps_and_faststart(tmp_path):
-    captured: list = []
-
-    async def fake_exec(*args, **kwargs):
-        captured.extend(args)
-        return _fake_proc(0)
-
-    with patch.object(state, "FFMPEG_PATH", "/usr/bin/ffmpeg"), \
-         patch.object(asyncio, "create_subprocess_exec", fake_exec):
-        ok = await utils.async_merge_audio_image("/img.jpg", "/aud.m4a", "/out.mp4", duration=10.0)
-
-    assert ok is True
-    fps = captured[captured.index("-framerate") + 1]
-    assert fps == "15" and int(fps) > 1
-    assert captured[captured.index("-r") + 1] == "15"
-    assert captured[captured.index("-movflags") + 1] == "+faststart"
+    assert "libx264" in captured_cmd
+    assert expected_audio_arg in captured_cmd
 
 
 @pytest.mark.asyncio

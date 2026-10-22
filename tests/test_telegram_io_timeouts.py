@@ -3,6 +3,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import telegram_io
+from telegram.error import BadRequest, RetryAfter, TimedOut
+
+
+@pytest.fixture(autouse=True)
+def _shared_download_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(telegram_io, "BASE_DOWNLOAD_DIR", str(tmp_path))
 
 
 class _FakeBot:
@@ -18,6 +24,18 @@ def _make_context():
     ctx = MagicMock()
     ctx.bot = _FakeBot()
     return ctx
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Chat_write_forbidden",
+        "Not enough rights to send photos to the chat",
+        "Have no rights to send a message",
+    ],
+)
+def test_permission_errors_are_permanent(message):
+    assert telegram_io.is_permanent_telegram_error(BadRequest(message)) is True
 
 
 @pytest.mark.asyncio
@@ -44,8 +62,9 @@ async def test_send_video_passes_path_and_timeouts(tmp_path):
 
 @pytest.mark.asyncio
 async def test_send_photo_passes_path_and_timeouts(tmp_path):
+    from PIL import Image
     f = tmp_path / "img.jpg"
-    f.write_bytes(b"x")
+    Image.new("RGB", (100, 100), color="red").save(f, format="JPEG")
     ctx = _make_context()
 
     with patch.object(telegram_io, "cfg", lambda key: 600 if key == "TELEGRAM_UPLOAD_TIMEOUT" else 10):
@@ -213,8 +232,7 @@ async def test_video_webm_falls_back_to_original_when_convert_fails(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_video_mp4_still_goes_through_codec_check(tmp_path):
-    """.mp4 também passa pela checagem de codec (pode ter AV1/HEVC); não é curto-circuitado pela extensão."""
+async def test_video_mp4_is_normalized_before_send(tmp_path):
     f = tmp_path / "clip.mp4"
     f.write_bytes(b"x")
     called = {"count": 0}
@@ -241,9 +259,10 @@ async def test_video_mp4_still_goes_through_codec_check(tmp_path):
 
 @pytest.mark.asyncio
 async def test_media_group_converts_webm_video(tmp_path):
+    from PIL import Image
     img = tmp_path / "a.jpg"
     vid = tmp_path / "b.webm"
-    img.write_bytes(b"x")
+    Image.new("RGB", (100, 100), color="red").save(img, format="JPEG")
     vid.write_bytes(b"y")
     converted = tmp_path / "b.tg.mp4"
 
@@ -280,10 +299,11 @@ async def test_media_group_converts_webm_video(tmp_path):
 
 @pytest.mark.asyncio
 async def test_media_group_passes_paths_and_timeouts(tmp_path):
+    from PIL import Image
     a = tmp_path / "a.jpg"
     b = tmp_path / "b.jpg"
-    a.write_bytes(b"x")
-    b.write_bytes(b"y")
+    Image.new("RGB", (100, 100), color="red").save(a, format="JPEG")
+    Image.new("RGB", (100, 100), color="blue").save(b, format="JPEG")
     ctx = _make_context()
 
     def fake_cfg(key):
@@ -310,3 +330,190 @@ async def test_media_group_passes_paths_and_timeouts(tmp_path):
     assert kwargs["read_timeout"] == 600
     assert kwargs["write_timeout"] == 600
     assert kwargs["connect_timeout"] == 600
+
+
+@pytest.mark.asyncio
+async def test_invalid_image_is_sent_as_document(tmp_path):
+    f = tmp_path / "not-really-an-image.jpg"
+    f.write_bytes(b"<html>blocked</html>")
+    ctx = _make_context()
+
+    with patch.object(telegram_io, "cfg", lambda key: 600 if key == "TELEGRAM_UPLOAD_TIMEOUT" else 10):
+        await telegram_io.send_downloaded_media(
+            context=ctx,
+            chat_id=1,
+            files=[str(f)],
+            original_msg_id=10,
+            upload_kwargs={},
+        )
+
+    assert ctx.bot.send_photo.await_count == 0
+    assert ctx.bot.send_document.await_args.kwargs["document"] == str(f)
+
+
+@pytest.mark.asyncio
+async def test_send_video_timeout_retries_video_without_document_fallback(tmp_path):
+    f = tmp_path / "slow.mp4"
+    f.write_bytes(b"x")
+    ctx = _make_context()
+    ctx.bot.send_video.side_effect = [TimedOut(), MagicMock(video=MagicMock(file_id="ok"), photo=None, animation=None, document=None)]
+
+    with patch.object(telegram_io, "cfg", lambda key: 600 if key == "TELEGRAM_UPLOAD_TIMEOUT" else 10), \
+         patch.object(telegram_io.asyncio, "sleep", AsyncMock()):
+        sent = await telegram_io.send_downloaded_media(
+            context=ctx, chat_id=1, files=[str(f)], original_msg_id=10, upload_kwargs={},
+        )
+
+    assert ctx.bot.send_video.await_count == 2
+    assert ctx.bot.send_document.await_count == 0
+    assert sent == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_send_video_retry_after_retries_video_without_document_fallback(tmp_path):
+    f = tmp_path / "limited.mp4"
+    f.write_bytes(b"x")
+    ctx = _make_context()
+    ctx.bot.send_video.side_effect = [RetryAfter(2), MagicMock(video=MagicMock(file_id="ok"), photo=None, animation=None, document=None)]
+
+    with patch.object(telegram_io, "cfg", lambda key: 600 if key == "TELEGRAM_UPLOAD_TIMEOUT" else 10), \
+         patch.object(telegram_io.asyncio, "sleep", AsyncMock()) as sleep_mock:
+        sent = await telegram_io.send_downloaded_media(
+            context=ctx, chat_id=1, files=[str(f)], original_msg_id=10, upload_kwargs={},
+        )
+
+    assert ctx.bot.send_video.await_count == 2
+    assert ctx.bot.send_document.await_count == 0
+    sleep_mock.assert_awaited_once_with(3)
+    assert sent == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_missing_reply_retries_same_video_without_reply_reference(tmp_path):
+    f = tmp_path / "reply.mp4"
+    f.write_bytes(b"x")
+    ctx = _make_context()
+    ctx.bot.send_video.side_effect = [
+        BadRequest("Message to be replied not found"),
+        MagicMock(video=MagicMock(file_id="ok"), photo=None, animation=None, document=None),
+    ]
+
+    with patch.object(telegram_io, "cfg", lambda key: 600 if key == "TELEGRAM_UPLOAD_TIMEOUT" else 10):
+        sent = await telegram_io.send_downloaded_media(
+            context=ctx,
+            chat_id=1,
+            files=[str(f)],
+            original_msg_id=10,
+            upload_kwargs={"reply_to_message_id": 10},
+        )
+
+    assert ctx.bot.send_video.await_count == 2
+    first, second = ctx.bot.send_video.await_args_list
+    assert first.kwargs["reply_to_message_id"] == 10
+    assert "reply_to_message_id" not in second.kwargs
+    assert ctx.bot.send_document.await_count == 0
+    assert sent == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_send_video_retry_exhaustion_is_not_silent(tmp_path):
+    f = tmp_path / "never-sent.mp4"
+    f.write_bytes(b"x")
+    ctx = _make_context()
+    ctx.bot.send_video.side_effect = TimedOut()
+
+    with patch.object(telegram_io, "cfg", lambda key: 600 if key == "TELEGRAM_UPLOAD_TIMEOUT" else 10), \
+         patch.object(telegram_io.asyncio, "sleep", AsyncMock()), \
+         pytest.raises(TimedOut):
+        await telegram_io.send_downloaded_media(
+            context=ctx, chat_id=1, files=[str(f)], original_msg_id=10, upload_kwargs={},
+        )
+
+    assert ctx.bot.send_video.await_count == 4
+    assert ctx.bot.send_document.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_video_is_prepared_only_once_across_upload_retries(tmp_path):
+    f = tmp_path / "once.mp4"
+    f.write_bytes(b"x")
+    ctx = _make_context()
+    ctx.bot.send_video.side_effect = [TimedOut(), MagicMock(video=MagicMock(file_id="ok"), photo=None, animation=None, document=None)]
+    ensure = AsyncMock(return_value=str(f))
+
+    with patch.object(telegram_io, "cfg", lambda key: 600 if key == "TELEGRAM_UPLOAD_TIMEOUT" else 10), \
+         patch.object(telegram_io.asyncio, "sleep", AsyncMock()), \
+         patch.object(telegram_io, "_ensure_video", ensure):
+        await telegram_io.send_downloaded_media(
+            context=ctx, chat_id=1, files=[str(f)], original_msg_id=10, upload_kwargs={},
+        )
+
+    ensure.assert_awaited_once_with(str(f))
+
+
+@pytest.mark.asyncio
+async def test_video_format_fallback_removes_missing_reply(tmp_path):
+    f = tmp_path / "odd.mp4"
+    f.write_bytes(b"x")
+    ctx = _make_context()
+    ctx.bot.send_video.side_effect = BadRequest("Wrong file type")
+    ctx.bot.send_document.side_effect = [
+        BadRequest("Message to be replied not found"),
+        MagicMock(video=None, photo=None, animation=None, document=MagicMock(file_id="doc")),
+    ]
+
+    with patch.object(telegram_io, "cfg", lambda key: 600 if key == "TELEGRAM_UPLOAD_TIMEOUT" else 10):
+        sent = await telegram_io.send_downloaded_media(
+            context=ctx,
+            chat_id=1,
+            files=[str(f)],
+            original_msg_id=10,
+            upload_kwargs={"reply_to_message_id": 10},
+        )
+
+    assert ctx.bot.send_document.await_count == 2
+    assert "reply_to_message_id" not in ctx.bot.send_document.await_args_list[1].kwargs
+    assert sent == ["doc"]
+
+
+@pytest.mark.asyncio
+async def test_animation_file_id_is_not_duplicated(tmp_path):
+    from PIL import Image
+    f = tmp_path / "loop.gif"
+    Image.new("RGB", (32, 32), color="green").save(f, format="GIF")
+    ctx = _make_context()
+    ctx.bot.send_animation.return_value = MagicMock(
+        animation=MagicMock(file_id="anim"), video=None, photo=None, document=None,
+    )
+
+    with patch.object(telegram_io, "cfg", lambda key: 600 if key == "TELEGRAM_UPLOAD_TIMEOUT" else 10), \
+         patch.object(telegram_io, "_gif_to_mp4", AsyncMock(return_value=str(f))):
+        sent = await telegram_io.send_downloaded_media(
+            context=ctx, chat_id=1, files=[str(f)], original_msg_id=10, upload_kwargs={},
+        )
+
+    assert sent == ["anim"]
+
+
+@pytest.mark.asyncio
+async def test_animation_is_prepared_only_once_across_upload_retries(tmp_path):
+    from PIL import Image
+    f = tmp_path / "retry.gif"
+    Image.new("RGB", (32, 32), color="purple").save(f, format="GIF")
+    ctx = _make_context()
+    ctx.bot.send_animation.side_effect = [
+        TimedOut(),
+        MagicMock(animation=MagicMock(file_id="anim"), video=None, photo=None, document=None),
+    ]
+    convert = AsyncMock(return_value=str(f))
+
+    with patch.object(telegram_io, "cfg", lambda key: 600 if key == "TELEGRAM_UPLOAD_TIMEOUT" else 10), \
+         patch.object(telegram_io.asyncio, "sleep", AsyncMock()), \
+         patch.object(telegram_io, "_gif_to_mp4", convert):
+        sent = await telegram_io.send_downloaded_media(
+            context=ctx, chat_id=1, files=[str(f)], original_msg_id=10, upload_kwargs={},
+        )
+
+    convert.assert_awaited_once_with(str(f))
+    assert ctx.bot.send_animation.await_count == 2
+    assert sent == ["anim"]

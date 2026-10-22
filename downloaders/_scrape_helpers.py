@@ -340,6 +340,38 @@ def merge_media_lists(*lists: Iterable[MediaTuple], cap: Optional[int] = None) -
     return out
 
 
+_ARTICLE_LIST_ITEM_RE = re.compile(r"^(?:[-*\u2022\u2023\u25aa]|\d+[.)])\s+")
+
+
+def _format_article_body(text: str) -> str:
+    """Transforma os blocos semanticos do extrator em paragrafos legiveis.
+
+    O Trafilatura devolve cada paragrafo, titulo ou item em uma linha, mas sem
+    linhas vazias. No Telegram isso deixa toda a materia visualmente colada.
+    Itens consecutivos de uma lista continuam juntos; os demais blocos recebem
+    uma linha vazia entre si.
+    """
+    if not text:
+        return ""
+
+    lines = [
+        re.sub(r"[ \t]+", " ", line).strip()
+        for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    ]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+
+    formatted = [lines[0]]
+    previous_is_list_item = bool(_ARTICLE_LIST_ITEM_RE.match(lines[0]))
+    for line in lines[1:]:
+        is_list_item = bool(_ARTICLE_LIST_ITEM_RE.match(line))
+        separator = "\n" if is_list_item and previous_is_list_item else "\n\n"
+        formatted.extend((separator, line))
+        previous_is_list_item = is_list_item
+    return "".join(formatted)
+
+
 def extract_article(
     html: str,
     url: str = "",
@@ -373,4 +405,4 @@ def extract_article(
             title = meta.title.strip()
     except Exception:
         pass
-    return title, body.strip()
+    return title, _format_article_body(body)

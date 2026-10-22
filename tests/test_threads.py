@@ -8,14 +8,13 @@ from downloaders.threads import (
     _extract_media,
     _extract_post_code,
     _find_post_by_code,
-    _resolve_post_code,
 )
 
 FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "threads")
 
 
 def _load_fixture(name: str) -> dict:
-    with open(os.path.join(FIXTURES_DIR, f"{name}.json")) as f:
+    with open(os.path.join(FIXTURES_DIR, f"{name}.json"), encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -29,26 +28,6 @@ def _load_fixture(name: str) -> dict:
 ])
 def test_extract_post_code(url, expected):
     assert _extract_post_code(url) == expected
-
-
-def test_resolve_post_code_direct_from_url():
-    assert _resolve_post_code("https://www.threads.com/@u/post/ABC123", None, "") == "ABC123"
-
-
-def test_resolve_post_code_from_final_url_after_share_redirect():
-    share = "https://www.threads.com/share/BARhnNRD1M/"
-    final = "https://www.threads.com/@r.znoone/post/Db0CFC1jJmq?xmt=AQ&slof=1"
-    assert _resolve_post_code(share, final, "<html></html>") == "Db0CFC1jJmq"
-
-
-def test_resolve_post_code_falls_back_to_og_url():
-    share = "https://www.threads.com/share/BARhnNRD1M/"
-    html = '<meta property="og:url" content="https://www.threads.com/@r.znoone/post/Db0CFC1jJmq" />'
-    assert _resolve_post_code(share, None, html) == "Db0CFC1jJmq"
-
-
-def test_resolve_post_code_returns_none_when_unresolvable():
-    assert _resolve_post_code("https://www.threads.com/share/XX/", "https://www.threads.com/share/XX/", "<html></html>") is None
 
 
 def test_extract_media_photo_single():

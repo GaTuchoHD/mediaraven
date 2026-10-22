@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 200" width="720" height="200" role="img" aria-label="MediaRaven banner">
-  <rect x="20" y="32" width="80" height="80" fill="#0f766e"/>
-  <rect x="48" y="60" width="80" height="80" fill="#0d9488"/>
-  <rect x="76" y="88" width="80" height="80" fill="#5eead4"/>
-
-  <text x="195" y="125" font-family="Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-weight="800" font-size="86" fill="#5eead4" letter-spacing="-3">
-    MediaRaven
-  </text>
-</svg>

@@ -4,7 +4,7 @@ import asyncio
 import pytest
 
 import state
-from lifecycle.services import get_chat_lock
+from lifecycle.chat_lock import get_chat_lock
 from lifecycle.playwright_refresh import _get_process_rss_mb
 
 

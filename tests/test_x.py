@@ -1,343 +1,165 @@
-import html
-import json
-import os
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from downloaders.x import (
-    _build_caption,
-    _extract_from_data,
-    _extract_tweet_id,
-    _extract_tweet_text,
-    _find_in_initial_state,
-    _media_from_extended_entities,
-    _normalize_x_url,
-    _walk_for_tweet_media,
-    _walk_for_tweet_obj,
-)
-
-FIXTURES_DIR = os.path.join(os.path.dirname(__file__), "fixtures", "x")
+from downloaders.x import download_x
 
 
-def _load_tweet(name: str) -> dict:
-    with open(os.path.join(FIXTURES_DIR, f"{name}.json")) as f:
-        return json.load(f)
-
-
-@pytest.mark.parametrize("url,expected", [
-    ("https://x.com/i/status/123", "123"),
-    ("https://x.com/user/status/456", "456"),
-    ("https://twitter.com/user/status/789?s=20", "789"),
-    ("https://fxtwitter.com/i/status/2043260334933410139", "2043260334933410139"),
-    ("https://x.com/user/status/123/photo/1", "123"),
-    ("https://x.com/user", None),
-    ("https://example.com/", None),
-])
-def test_extract_tweet_id(url, expected):
-    assert _extract_tweet_id(url) == expected
-
-
-@pytest.mark.parametrize("input_url,expected", [
-    ("https://twitter.com/i/status/123", "https://x.com/i/status/123"),
-    ("https://fxtwitter.com/u/status/456", "https://x.com/u/status/456"),
-    ("https://vxtwitter.com/u/status/456", "https://x.com/u/status/456"),
-    ("https://www.fxtwitter.com/u/status/456", "https://x.com/u/status/456"),
-    ("https://mobile.twitter.com/u/status/456", "https://x.com/u/status/456"),
-    ("https://x.com/u/status/456", "https://x.com/u/status/456"),
-])
-def test_normalize_x_url(input_url, expected):
-    assert _normalize_x_url(input_url) == expected
-
-
-def test_media_from_photo_only_uses_orig_resolution():
-    tweet = _load_tweet("photo_single")
-    media = tweet["extended_entities"]["media"]
-    items = _media_from_extended_entities(media)
-    assert len(items) == 1
-    kind, url = items[0]
-    assert kind == "image"
-    assert "name=orig" in url
-    assert url.startswith("https://pbs.twimg.com/")
-
-
-def test_media_from_video_picks_highest_bitrate_mp4():
-    tweet = _load_tweet("video")
-    media = tweet["extended_entities"]["media"]
-    items = _media_from_extended_entities(media)
-    assert len(items) == 1
-    kind, url = items[0]
-    assert kind == "video"
-    assert url.endswith(".mp4") or ".mp4?" in url
-    assert "&#x3D;" not in url and "&amp;" not in url
-
-    variants = media[0]["video_info"]["variants"]
-    mp4s = [v for v in variants if (v.get("content_type") or "").startswith("video/mp4")]
-    max_br = max(v.get("bitrate") or 0 for v in mp4s)
-    expected_raw = next(v["url"] for v in mp4s if v.get("bitrate") == max_br)
-    assert url == html.unescape(expected_raw)
-
-
-def test_media_unescapes_html_entities_in_urls():
-    media = [{"type": "video", "video_info": {"variants": [
-        {"content_type": "video/mp4", "bitrate": 1000,
-         "url": "https://video.twimg.com/x.mp4?tag&#x3D;19&amp;v&#x3D;372"},
-    ]}}]
-    items = _media_from_extended_entities(media)
-    assert items == [("video", "https://video.twimg.com/x.mp4?tag=19&v=372")]
-
-    media_photo = [{"type": "photo", "media_url_https": "https://pbs.twimg.com/x.jpg?foo&#x3D;1"}]
-    items = _media_from_extended_entities(media_photo)
-    assert items == [("image", "https://pbs.twimg.com/x.jpg?foo=1&name=orig")]
-
-
-def test_media_skips_when_no_mp4_variants():
-    media = [{"type": "video", "video_info": {"variants": [
-        {"content_type": "application/x-mpegURL", "url": "x.m3u8"},
-    ]}}]
-    assert _media_from_extended_entities(media) == []
-
-
-def test_media_handles_animated_gif_like_video():
-    media = [{"type": "animated_gif", "video_info": {"variants": [
-        {"content_type": "video/mp4", "bitrate": 0, "url": "https://video.twimg.com/x.mp4"},
-    ]}}]
-    items = _media_from_extended_entities(media)
-    assert items == [("video", "https://video.twimg.com/x.mp4")]
-
-
-def test_media_appends_query_param_correctly_when_already_has_query():
-    media = [{"type": "photo", "media_url_https": "https://pbs.twimg.com/x.jpg?foo=1"}]
-    items = _media_from_extended_entities(media)
-    assert items == [("image", "https://pbs.twimg.com/x.jpg?foo=1&name=orig")]
-
-
-def test_find_in_initial_state_returns_tweet():
-    state = {"entities": {"tweets": {"entities": {"123": {"id_str": "123", "full_text": "hi"}}}}}
-    found = _find_in_initial_state(state, "123")
-    assert found is not None
-    assert found["id_str"] == "123"
-
-
-def test_find_in_initial_state_returns_none_when_absent():
-    assert _find_in_initial_state({}, "999") is None
-    assert _find_in_initial_state({"entities": {}}, "999") is None
-    assert _find_in_initial_state({"entities": {"tweets": {"entities": {}}}}, "999") is None
-
-
-def test_walk_for_tweet_media_finds_in_graphql_shape():
-    graphql_response = {
-        "data": {
-            "threaded_conversation_with_injections_v2": {
-                "instructions": [{
-                    "entries": [{
-                        "content": {
-                            "itemContent": {
-                                "tweet_results": {
-                                    "result": {
-                                        "rest_id": "555",
-                                        "legacy": {
-                                            "id_str": "555",
-                                            "extended_entities": {
-                                                "media": [
-                                                    {"type": "photo", "media_url_https": "https://pbs.twimg.com/a.jpg"},
-                                                ]
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }]
-                }]
-            }
-        }
-    }
-    medias = list(_walk_for_tweet_media(graphql_response, "555"))
-    assert len(medias) >= 1
-    items = _media_from_extended_entities(medias[0])
-    assert items == [("image", "https://pbs.twimg.com/a.jpg?name=orig")]
-
-
-def test_walk_for_tweet_media_skips_unrelated_tweets():
-    response = {
-        "tweet_a": {"id_str": "111", "extended_entities": {"media": [{"type": "photo", "media_url_https": "u1"}]}},
-        "tweet_b": {"id_str": "222", "extended_entities": {"media": [{"type": "photo", "media_url_https": "u2"}]}},
-    }
-    medias = list(_walk_for_tweet_media(response, "222"))
-    assert len(medias) == 1
-    assert medias[0][0]["media_url_https"] == "u2"
-
-
-def test_full_pipeline_with_real_video_fixture():
-    tweet = _load_tweet("video")
-    initial_state = {"entities": {"tweets": {"entities": {"2043472628770275518": tweet}}}}
-    found = _find_in_initial_state(initial_state, "2043472628770275518")
-    assert found is not None
-    items = _media_from_extended_entities(found["extended_entities"]["media"])
-    assert len(items) == 1
-    assert items[0][0] == "video"
-
-
-def test_extract_tweet_text_uses_display_text_range_to_strip_trailing_url():
-    tweet = _load_tweet("video")
-    text = _extract_tweet_text(tweet)
-    assert text.startswith("O bolo")
-    assert "https://t.co/" not in text
-
-
-def test_extract_tweet_text_returns_empty_for_media_only_post():
-    tweet = _load_tweet("photo_single")
-    assert _extract_tweet_text(tweet) == ""
-
-
-def test_extract_tweet_text_handles_legacy_wrapping():
-    wrapped = {"legacy": {"full_text": "hello", "display_text_range": [0, 5]}}
-    assert _extract_tweet_text(wrapped) == "hello"
-
-
-def test_extract_tweet_text_strips_trailing_tco_when_no_range():
-    tweet = {"full_text": "Olha isso https://t.co/abc"}
-    assert _extract_tweet_text(tweet) == "Olha isso"
-
-
-def test_extract_tweet_text_unescapes_html_entities():
-    tweet = {"full_text": "isso &amp; aquilo", "display_text_range": [0, 17]}
-    assert _extract_tweet_text(tweet) == "isso & aquilo"
-
-
-def test_extract_tweet_text_handles_none():
-    assert _extract_tweet_text(None) == ""
-    assert _extract_tweet_text({}) == ""
-
-
-def test_build_caption_with_text():
-    tweet = {"full_text": "Hello <world>", "display_text_range": [0, 13]}
-    short, full = _build_caption(tweet, "https://x.com/u/status/1")
-    assert "Hello &lt;world&gt;" in short
-    assert "https://x.com/u/status/1" in short
-    assert "<a href=" in short
-    assert "Hello &lt;world&gt;" in full
-
-
-def test_build_caption_without_text_or_user_returns_empty():
-    short, _full = _build_caption(None, "https://x.com/i/web/status/1")
+@pytest.mark.asyncio
+async def test_download_x_rejects_url_without_status(tmp_path):
+    files, _status, short, full = await download_x(
+        "https://x.com/example", str(tmp_path)
+    )
+    assert files == []
     assert short == ""
+    assert full == ""
 
 
-def test_build_caption_truncates_very_long_text():
-    long_text = "a" * 1500
-    tweet = {"full_text": long_text, "display_text_range": [0, 1500]}
-    short, full = _build_caption(tweet, "https://x.com/u/status/1")
-    assert "..." in short or "…" in short
-    assert len(short) < 1500
-    assert "a" * 1500 in full
+@pytest.mark.asyncio
+async def test_download_x_handles_api_failure(tmp_path):
+    response = Mock(status_code=503)
+    with patch("downloaders.x.requests.get", return_value=response):
+        files, _status, short, full = await download_x(
+            "https://x.com/example/status/123", str(tmp_path)
+        )
+    assert files == []
+    assert short == ""
+    assert full == ""
 
 
-def test_build_caption_includes_screen_name_as_title():
-    tweet = {
-        "full_text": "Hello world",
-        "display_text_range": [0, 11],
-        "user": {"screen_name": "elonmusk"},
-    }
-    short, _full = _build_caption(tweet, "https://x.com/elonmusk/status/1")
-    assert "@elonmusk" in short
-    assert "Hello world" in short
-
-
-def test_build_caption_falls_back_to_screen_name_from_url():
-    tweet = {"full_text": "Texto do tweet", "display_text_range": [0, 14]}
-    short, _full = _build_caption(tweet, "https://x.com/jack/status/12345")
-    assert "@jack" in short
-    assert "Texto do tweet" in short
-
-
-def test_build_caption_skips_i_path_in_url():
-    tweet = {"full_text": "Texto", "display_text_range": [0, 5]}
-    short, _full = _build_caption(tweet, "https://x.com/i/web/status/12345")
-    assert "@i" not in short
-    assert "Texto" in short
-
-
-def test_extract_from_data_resolves_user_dict_when_user_is_id():
-    data = {
-        "entities": {
-            "tweets": {"entities": {
-                "999": {
-                    "id_str": "999",
-                    "full_text": "tweet body",
-                    "display_text_range": [0, 10],
-                    "user": "42",
-                    "extended_entities": {"media": [{
-                        "type": "photo", "media_url_https": "https://pbs.twimg.com/x.jpg",
-                    }]},
-                },
-            }},
-            "users": {"entities": {
-                "42": {"screen_name": "alice", "id_str": "42"},
-            }},
+@pytest.mark.asyncio
+async def test_download_x_downloads_photo_and_best_video(tmp_path):
+    response = Mock(status_code=200)
+    response.json.return_value = {
+        "tweet": {
+            "author": {"name": "Alice", "screen_name": "alice"},
+            "text": "Veja <isso> #tag @alguem",
+            "media": {
+                "all": [
+                    {"type": "photo", "url": "https://cdn.example/photo.jpg"},
+                    {
+                        "type": "video",
+                        "variants": [
+                            {
+                                "content_type": "video/mp4",
+                                "bitrate": 256000,
+                                "url": "https://cdn.example/low.mp4",
+                            },
+                            {
+                                "content_type": "video/mp4",
+                                "bitrate": 2176000,
+                                "url": "https://cdn.example/high.mp4",
+                            },
+                            {
+                                "content_type": "application/x-mpegURL",
+                                "url": "https://cdn.example/stream.m3u8",
+                            },
+                        ],
+                    },
+                ]
+            },
         }
     }
-    media_items, tweet = _extract_from_data(data, "999")
-    assert tweet is not None
-    assert isinstance(tweet["user"], dict)
-    assert tweet["user"]["screen_name"] == "alice"
-    cap_short, _ = _build_caption(tweet, "https://x.com/i/status/999")
-    assert "@alice" in cap_short
-    assert "tweet body" in cap_short
+
+    async def fake_download(url, destination, **_kwargs):
+        Path(destination).write_bytes(b"x" * 2048)
+        return True
+
+    mocked_download = AsyncMock(side_effect=fake_download)
+    with (
+        patch("downloaders.x.requests.get", return_value=response),
+        patch("downloaders.x.async_download_file", mocked_download),
+    ):
+        files, _status, short, full = await download_x(
+            "https://x.com/example/status/123", str(tmp_path)
+        )
+
+    assert len(files) == 2
+    called_urls = [call.args[0] for call in mocked_download.await_args_list]
+    assert called_urls == [
+        "https://cdn.example/photo.jpg",
+        "https://cdn.example/high.mp4",
+    ]
+    assert "Alice" in short
+    assert "&lt;isso&gt;" in short
+    assert "#tag" not in short
+    assert "@alguem" not in short
+    assert "https://x.com/example/status/123" in full
 
 
-def test_extract_from_data_ignores_reply_video_in_same_conversation():
-    data = {
-        "data": {
-            "threaded_conversation_with_injections_v2": {
-                "instructions": [{
-                    "entries": [
-                        {"content": {"itemContent": {"tweet_results": {"result": {
-                            "rest_id": "100",
-                            "legacy": {
-                                "id_str": "100",
-                                "conversation_id_str": "100",
-                                "extended_entities": {"media": [
-                                    {"type": "photo", "media_url_https": "https://pbs.twimg.com/focal.jpg"},
-                                ]},
-                            },
-                        }}}}},
-                        {"content": {"itemContent": {"tweet_results": {"result": {
-                            "rest_id": "200",
-                            "legacy": {
-                                "id_str": "200",
-                                "conversation_id_str": "100",
-                                "extended_entities": {"media": [
-                                    {"type": "video", "video_info": {"variants": [
-                                        {"content_type": "video/mp4", "bitrate": 9, "url": "https://video.twimg.com/reply.mp4"},
-                                    ]}},
-                                ]},
-                            },
-                        }}}}},
+@pytest.mark.asyncio
+async def test_download_x_ignores_failed_or_tiny_downloads(tmp_path):
+    response = Mock(status_code=200)
+    response.json.return_value = {
+        "tweet": {
+            "media": {
+                "all": [
+                    {"type": "photo", "url": "https://cdn.example/failed.jpg"},
+                    {"type": "photo", "url": "https://cdn.example/tiny.jpg"},
+                ]
+            }
+        }
+    }
+
+    async def fake_download(url, destination, **_kwargs):
+        if url.endswith("failed.jpg"):
+            return False
+        Path(destination).write_bytes(b"tiny")
+        return True
+
+    with (
+        patch("downloaders.x.requests.get", return_value=response),
+        patch("downloaders.x.async_download_file", AsyncMock(side_effect=fake_download)),
+    ):
+        files, _status, _short, _full = await download_x(
+            "https://x.com/example/status/123", str(tmp_path)
+        )
+
+    assert files == []
+
+
+@pytest.mark.asyncio
+async def test_download_x_uses_quote_media_when_main_tweet_has_none(tmp_path):
+    response = Mock(status_code=200)
+    response.json.return_value = {
+        "tweet": {
+            "author": {"name": "Bob", "screen_name": "bob"},
+            "text": "Veja este post citado",
+            "quote": {
+                "media": {
+                    "all": [
+                        {
+                            "type": "photo",
+                            "url": "https://cdn.example/quoted-one.jpg",
+                        },
+                        {
+                            "type": "photo",
+                            "url": "https://cdn.example/quoted-two.jpg",
+                        },
                     ]
-                }]
-            }
+                }
+            },
         }
     }
-    media_items, _tweet = _extract_from_data(data, "100")
-    assert media_items == [("image", "https://pbs.twimg.com/focal.jpg?name=orig")]
 
+    async def fake_download(url, destination, **_kwargs):
+        Path(destination).write_bytes(b"x" * 2048)
+        return True
 
-def test_walk_for_tweet_media_ignores_reply_in_same_conversation():
-    reply = {"id_str": "200", "conversation_id_str": "100",
-             "extended_entities": {"media": [{"type": "video"}]}}
-    assert list(_walk_for_tweet_media(reply, "100")) == []
+    mocked_download = AsyncMock(side_effect=fake_download)
+    with (
+        patch("downloaders.x.requests.get", return_value=response),
+        patch("downloaders.x.async_download_file", mocked_download),
+    ):
+        files, _status, short, full = await download_x(
+            "https://x.com/example/status/123", str(tmp_path)
+        )
 
-
-def test_walk_for_tweet_obj_finds_in_graphql_legacy_shape():
-    response = {
-        "data": {
-            "result": {
-                "rest_id": "999",
-                "legacy": {"id_str": "999", "full_text": "found me"}
-            }
-        }
-    }
-    found = list(_walk_for_tweet_obj(response, "999"))
-    assert len(found) >= 1
-    assert any(t.get("full_text") == "found me" or t.get("rest_id") == "999" for t in found)
+    assert len(files) == 2
+    assert [call.args[0] for call in mocked_download.await_args_list] == [
+        "https://cdn.example/quoted-one.jpg",
+        "https://cdn.example/quoted-two.jpg",
+    ]
+    assert "Veja este post citado" in short
+    assert "https://x.com/example/status/123" in full

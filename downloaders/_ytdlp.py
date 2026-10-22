@@ -12,6 +12,7 @@ from config import (
     FIREFOX_PROFILE_PATH,
 )
 from messages import lmsg
+from ytdlp_diagnostics import summarize_errors
 
 from ._platform import Platform
 
@@ -29,13 +30,15 @@ def _build_ytdlp_base_opts(unique_folder: str) -> dict[str, Any]:
         'geo_bypass': True,
         'socket_timeout': cfg("YTDLP_SOCKET_TIMEOUT"),
         'remote_components': ['ejs:github'],
-        # Pela API o yt-dlp quer {chave: [valores]}; a forma "player_client=a,b" é só da linha de comando e aqui era ignorada.
-        'extractor_args': {'youtube': {'player_client': [c.strip() for c in str(cfg("YTDLP_YT_CLIENTS")).split(',') if c.strip()]}},
-        'format_sort': ['vcodec:h264', 'acodec:aac'],
-        'impersonate': ImpersonateTarget('chrome'),
+        'extractor_args': {
+            'youtube': [f'player_client={cfg("YTDLP_YT_CLIENTS")}'],
+            'youtubepot-bgutilhttp': [f'base_url=http://127.0.0.1:{cfg("BGUTIL_PORT")}'],
+        },
     }
-    if state.DENO_PATH:
-        opts['js_runtimes'] = {'deno': {'path': state.DENO_PATH}}
+    if os.path.exists('/usr/bin/node'):
+        opts['js_runtimes'] = {'node': {}}
+    elif state.DENO_PATH:
+        opts['js_runtimes'] = {'deno': {}}
     return opts
 
 
@@ -60,19 +63,6 @@ def _is_hls_only(formats: list[dict]) -> bool:
     return has_video
 
 
-def _live_reason(info: Optional[dict]) -> Optional[str]:
-    if not isinstance(info, dict):
-        return None
-    status = info.get('live_status')
-    if status == 'is_live':
-        return 'live_in_progress'
-    if status == 'is_upcoming':
-        return 'live_not_started'
-    if info.get('is_live') and status not in ('was_live', 'post_live', 'not_live'):
-        return 'live_in_progress'
-    return None
-
-
 def _build_format_selector(
     height: int,
     cap_mb: int,
@@ -89,6 +79,10 @@ def _build_format_selector(
         if tbr_filter:
             tiers.append(f'best[height<={height}][language^={target_lang}]{tbr_filter}')
         tiers.append(f'bestvideo[height<={height}]{fs_video}+bestaudio[language^={target_lang}]')
+    # Preferir H.264 (avc) para evitar recodificação AV1→H264 pelo FFmpeg
+    tiers.append(f'bestvideo[height<={height}][vcodec^=avc][ext=mp4]{fs_video}+bestaudio[ext=m4a]')
+    tiers.append(f'bestvideo[height<={height}][vcodec^=avc]{fs_video}+bestaudio[ext=m4a]')
+    tiers.append(f'bestvideo[height<={height}][ext=mp4]{fs_video}+bestaudio[ext=m4a]')
     tiers.append(f'bestvideo[height<={height}]{fs_video}+bestaudio')
     tiers.append(f'best[height<={height}]{fs_total}')
     if tbr_filter:
@@ -98,6 +92,20 @@ def _build_format_selector(
         tiers.append(f'best{tbr_filter}')
     tiers.append('best')
     return '/'.join(tiers)
+
+
+def _build_progressive_fallback_selector(height: int, cap_mb: int) -> str:
+    """Prefer a combined A/V format when YouTube adaptive URLs return 403."""
+    return '/'.join([
+        f'best[height<={height}][ext=mp4][filesize_approx<{cap_mb}M]',
+        f'best[height<={height}][ext=mp4]',
+        'best[ext=mp4]',
+        'best',
+    ])
+
+
+def _has_http_403(errors: list[str]) -> bool:
+    return any('http error 403' in str(error).lower() for error in errors)
 
 
 def _apply_format_selection(
@@ -137,13 +145,10 @@ def _apply_format_selection(
         )
         opts['merge_output_format'] = 'mp4'
 
-    if not use_impersonate:
+    if use_impersonate and (platform.facebook or platform.instagram or platform.reddit):
+        opts['impersonate'] = ImpersonateTarget('chrome')
+    elif not use_impersonate:
         opts.pop('impersonate', None)
-
-    if platform.tiktok:
-        tiktok_proxy = cfg("TIKTOK_PROXY")
-        if tiktok_proxy:
-            opts['proxy'] = tiktok_proxy
 
 
 class _ErrorCapturingLogger:
@@ -248,11 +253,14 @@ def _wipe_folder(folder: str) -> None:
 
 
 def _attempt_order(
-    has_firefox_cookie: bool, target_lang: Optional[str], platform: Optional[Platform] = None,
+    has_firefox_cookie: bool,
+    target_lang: Optional[str],
+    prefer_cookie: bool = False,
 ) -> list[str]:
     attempts: list[str] = []
-    cookie_first = bool(target_lang and target_lang != 'original') or bool(platform and platform.tiktok)
-    if cookie_first:
+    if prefer_cookie and has_firefox_cookie:
+        attempts.extend(["with_cookie", "no_cookie"])
+    elif target_lang and target_lang != 'original':
         if has_firefox_cookie:
             attempts.append("with_cookie")
         attempts.append("no_cookie")
@@ -294,6 +302,7 @@ async def _run_ytdlp_with_cookie_fallback(
     has_firefox_cookie: bool,
     target_lang: Optional[str],
     platform: Optional[Platform] = None,
+    pre_info: Optional[dict] = None,
 ) -> tuple[list[str], dict[str, Any], Optional[str]]:
     loop = asyncio.get_running_loop()
     info_dict: dict[str, Any] = {}
@@ -301,7 +310,11 @@ async def _run_ytdlp_with_cookie_fallback(
     all_errors: list[str] = []
 
     last_exc: Optional[BaseException] = None
-    base_attempts = _attempt_order(has_firefox_cookie, target_lang, platform)
+    base_attempts = _attempt_order(
+        has_firefox_cookie,
+        target_lang,
+        prefer_cookie=bool(platform is not None and platform.youtube),
+    )
     expanded_attempts = _expand_attempts_with_impersonate(base_attempts, platform)
     for mode, use_imp in expanded_attempts:
         _wipe_folder(unique_folder)
@@ -312,11 +325,7 @@ async def _run_ytdlp_with_cookie_fallback(
             current_opts['cookiesfrombrowser'] = ('firefox', FIREFOX_PROFILE_PATH, None, None)
 
         if platform is not None:
-            info_for_select = None if platform.reddit else await _pre_extract(base_opts, url, mode)
-            live_reason = _live_reason(info_for_select)
-            if live_reason:
-                logger.info(lmsg("_ytdlp.live_detectada", reason=live_reason))
-                return [], info_for_select or {}, live_reason
+            info_for_select = pre_info or (None if platform.reddit else await _pre_extract(base_opts, url, mode))
             _apply_format_selection(
                 current_opts, platform, target_lang,
                 info=info_for_select, use_impersonate=use_imp,
@@ -344,7 +353,48 @@ async def _run_ytdlp_with_cookie_fallback(
                 downloaded_files = sorted(current_files)
                 logger.info(lmsg("_ytdlp.download_bem_sucedido", mode=attempt_label))
                 break
+
+            if (
+                platform is not None
+                and platform.youtube
+                and mode == "with_cookie"
+                and _has_http_403(attempt_errors)
+            ):
+                # YouTube may expose high-quality adaptive formats in metadata
+                # but require a GVS PO Token when the media URL is fetched. A
+                # progressive format (video+audio in one file, commonly format
+                # 18) remains downloadable with the same authenticated cookies.
+                # Retry it only after a real 403 so normal high-quality downloads
+                # keep their existing priority.
+                logger.warning(
+                    "YouTube retornou HTTP 403 no fluxo adaptativo; "
+                    "tentando formato progressivo autenticado."
+                )
+                _wipe_folder(unique_folder)
+                progressive_opts = current_opts.copy()
+                progressive_opts['format'] = _build_progressive_fallback_selector(
+                    cfg("YTDLP_MAX_HEIGHT"), cfg("TELEGRAM_MAX_UPLOAD_MB")
+                )
+                progressive_result, progressive_errors = await loop.run_in_executor(
+                    state.YTDLP_POOL,
+                    _yt_dlp_extract,
+                    progressive_opts,
+                    url,
+                    True,
+                    True,
+                )
+                all_errors.extend(progressive_errors)
+                if progressive_result:
+                    info_dict = progressive_result
+                progressive_files = _list_downloaded_files(unique_folder)
+                if progressive_files:
+                    downloaded_files = sorted(progressive_files)
+                    logger.info(
+                        "Download do YouTube concluído pelo fallback progressivo."
+                    )
+                    break
             logger.warning(lmsg("_ytdlp.yt_dlp_falhou", mode=attempt_label))
+            logger.warning("yt-dlp attempt=%s outcome=failed cause=%s", attempt_label, summarize_errors(attempt_errors))
         except Exception as e:
             last_exc = e
             logger.warning(lmsg("_ytdlp.yt_dlp_exce_o", mode=attempt_label, e=e))

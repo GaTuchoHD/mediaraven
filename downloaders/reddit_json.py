@@ -1,40 +1,113 @@
 import asyncio
-import html
+from http.cookiejar import LoadError, MozillaCookieJar
 import logging
 import os
-import re
-from urllib.parse import urljoin
+from urllib.parse import urlsplit, urlunsplit
 
-import aiohttp
-from curl_cffi import requests as curl_requests
+from aiohttp import ClientResponseError
 
 import state
 from config import cfg
 from cookies import get_aiohttp_cookies_for_url
 from messages import lmsg, msg
 from utils import async_download_file, normalize_image, safe_url
+from curl_cffi import requests as cffi_requests
+from url_safety import safe_aiohttp_get, safe_curl_get
 
-from .reddit_common import (
-    build_reddit_caption, clean_reddit_media_url, is_reddit_media_url, looks_like_image, reddit_external_link,
-)
+from .reddit_common import build_reddit_caption, clean_reddit_media_url, looks_like_image
 
 logger = logging.getLogger(__name__)
 
-_REDDIT_GUEST_BOOTSTRAP_URL = "https://old.reddit.com/"
-_reddit_session_ready = False
+# Internal dispatcher signal. It must never be shown to the Telegram user.
+REDDIT_JSON_VIDEO = "__reddit_json_video__"
+REDDIT_UNAVAILABLE = "__reddit_unavailable__"
 
-# Desafio JS do Reddit (out/2026): o script só dobra a semente e reenvia o form via GET.
-_JSC_SEED_RE = re.compile(r'\(async e=>e\+e\)\("([0-9a-f]+)"\)')
-_JSC_ACTION_RE = re.compile(r'<form[^>]*action="([^"]+)"')
-_JSC_INPUT_RE = re.compile(r'<input type="hidden" name="(\w+)"(?: value="([^"]*)")?')
-_POST_RE = re.compile(r'<shreddit-post\b([^>]*)>(.*?)</shreddit-post>', re.S)
-_ATTR_RE = re.compile(r'([\w-]+)="([^"]*)"')
-_PLAYER_RE = re.compile(r'<shreddit-player\b[^>]*\bsrc="([^"]+)"')
-_IREDDIT_RE = re.compile(r'https://i\.redd\.it/[^"?&\s]+')
+_REDDIT_COOKIE_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "reddit_cookies.txt",
+)
 
 
-def _reddit_json_headers() -> dict:
+def _load_reddit_cookie_file() -> dict[str, str]:
+    """Load the dedicated Reddit Netscape cookie jar without exposing values."""
+    if not os.path.isfile(_REDDIT_COOKIE_FILE):
+        return {}
+
+    jar = MozillaCookieJar(_REDDIT_COOKIE_FILE)
+    try:
+        jar.load(ignore_discard=True, ignore_expires=False)
+    except (LoadError, OSError) as exc:
+        logger.warning("⚠️ Não foi possível carregar os cookies do Reddit: %s", exc)
+        return {}
+
     return {
+        cookie.name: cookie.value
+        for cookie in jar
+        if not cookie.is_expired()
+    }
+
+
+def _is_reddit_video_post(post_data: dict) -> bool:
+    """Detect Reddit video metadata, including crosspost wrappers."""
+    pending = [post_data]
+    visited = 0
+    while pending and visited < 8:
+        candidate = pending.pop(0)
+        if not isinstance(candidate, dict):
+            continue
+        visited += 1
+
+        secure_media = candidate.get("secure_media") or {}
+        media = candidate.get("media") or {}
+        media_url = candidate.get("url") or ""
+        media_host = (urlsplit(media_url).hostname or "").lower()
+        if (
+            candidate.get("is_video")
+            or candidate.get("post_hint") in ("hosted:video", "rich:video")
+            or bool(secure_media.get("reddit_video"))
+            or bool(media.get("reddit_video"))
+            or media_host == "v.redd.it"
+        ):
+            return True
+
+        crossposts = candidate.get("crosspost_parent_list") or []
+        if isinstance(crossposts, list):
+            pending.extend(item for item in crossposts if isinstance(item, dict))
+    return False
+
+
+async def _fetch_reddit_json_with_curl(json_url: str) -> list:
+    """Use curl's TLS/HTTP stack when Reddit blocks aiohttp's fingerprint."""
+    def _request() -> list:
+        response = safe_curl_get(
+            (state.CFFI_SESSION or cffi_requests).get,
+            json_url,
+            impersonate="chrome124",
+            timeout=20,
+            headers={
+                "User-Agent": cfg("REDDIT_JSON_UA"),
+                "Accept": "application/json",
+            },
+            cookies=_load_reddit_cookie_file(),
+        )
+        response.raise_for_status()
+        return response.json()
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(state.IO_POOL, _request)
+
+
+async def download_reddit_json(url: str, unique_folder: str) -> tuple[list[str], str, str, str]:
+    logger.info(lmsg("reddit_json.iniciando_extra_o_via", arg0=safe_url(url)))
+    if not os.path.exists(unique_folder):
+        os.makedirs(unique_folder)
+
+    media_urls = []
+    downloaded_files = []
+    title = ""
+    selftext = ""
+
+    headers = {
         'User-Agent': cfg("REDDIT_JSON_UA"),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'pt-BR,pt;q=0.8,en-US;q=0.5,en;q=0.3',
@@ -45,169 +118,84 @@ def _reddit_json_headers() -> dict:
         'Sec-Fetch-User': '?1',
     }
 
-
-async def _ensure_reddit_session(force: bool = False) -> None:
-    global _reddit_session_ready
-    if _reddit_session_ready and not force:
-        return
-    try:
-        async with state.AIOHTTP_SESSION.get(
-            _REDDIT_GUEST_BOOTSTRAP_URL, headers=_reddit_json_headers(),
-            allow_redirects=True, timeout=15,
-        ) as resp:
-            await resp.read()
-        _reddit_session_ready = True
-        logger.info(lmsg("reddit_json.sessao_anonima_ok"))
-    except Exception as e:
-        logger.debug(lmsg("reddit_json.sessao_anonima_falhou", e=e))
-
-
-async def _fetch_reddit_post_data(url: str) -> dict:
-    await _ensure_reddit_session()
-    cookies_dict = dict(get_aiohttp_cookies_for_url(url) or {})
-    cookies_dict.setdefault('over18', '1')
+    cookies_dict = get_aiohttp_cookies_for_url(url)
+    reddit_file_cookies = _load_reddit_cookie_file()
+    if reddit_file_cookies:
+        cookies_dict.update(reddit_file_cookies)
+        logger.info(
+            "🍪 Usando %d cookies do arquivo dedicado do Reddit.",
+            len(reddit_file_cookies),
+        )
     if cookies_dict:
-        logger.info(lmsg("reddit_json.usando_x_cookies", arg0=len(cookies_dict)))
-    clean_url = url.split('?')[0].rstrip('/')
-    json_url = f"{clean_url}.json?raw_json=1"
-
-    async def _get() -> dict:
-        async with state.AIOHTTP_SESSION.get(json_url, headers=_reddit_json_headers(), cookies=cookies_dict, timeout=15) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-        return data[0]['data']['children'][0]['data']
+         logger.info(lmsg("reddit_json.usando_x_cookies", arg0=len(cookies_dict)))
 
     try:
-        return await _get()
-    except aiohttp.ClientResponseError as e:
-        if e.status not in (403, 429):
-            raise
-        await _ensure_reddit_session(force=True)
-    try:
-        return await _get()
-    except aiohttp.ClientResponseError as e:
-        if e.status != 403:
-            raise
-    # Desde out/2026 a API JSON dá 403 pra anônimo; a página do post ainda abre.
-    logger.info(lmsg("reddit_json.usando_pagina_html"))
-    return _post_data_from_html(await _fetch_reddit_page(clean_url + '/'))
+        parsed_url = urlsplit(url)
+        clean_url = urlunsplit(
+            (parsed_url.scheme, parsed_url.netloc, parsed_url.path.rstrip('/'), '', '')
+        )
+        json_url = f"{clean_url}.json?raw_json=1"
 
+        try:
+            async with safe_aiohttp_get(
+                state.AIOHTTP_SESSION, json_url,
+                headers=headers, cookies=cookies_dict, timeout=15,
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+        except ClientResponseError as exc:
+            if exc.status != 403:
+                raise
+            logger.info(
+                "↪️ Reddit bloqueou o aiohttp; repetindo a consulta pelo transporte compatível."
+            )
+            data = await _fetch_reddit_json_with_curl(json_url)
 
-def _fetch_reddit_page_sync(url: str) -> str:
-    # aiohttp leva 403 mesmo resolvendo o desafio; precisa da digital TLS de navegador.
-    with curl_requests.Session(impersonate="firefox", timeout=15) as s:
-        r = s.get(url)
-        seed = _JSC_SEED_RE.search(r.text)
-        if seed:
-            fields = {k: html.unescape(v) for k, v in _JSC_INPUT_RE.findall(r.text)}
-            fields['solution'] = seed.group(1) * 2
-            action = _JSC_ACTION_RE.search(r.text)
-            r = s.get(urljoin(url, html.unescape(action.group(1))) if action else url, params=fields)
-        r.raise_for_status()
-        return r.text
-
-
-async def _fetch_reddit_page(url: str) -> str:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(state.IO_POOL, _fetch_reddit_page_sync, url)
-
-
-def _post_data_from_html(page: str) -> dict:
-    """Monta, a partir do <shreddit-post>, um dict com os campos do JSON que o
-    resto do fluxo usa. `_media_urls` traz as imagens (i.redd.it) na ordem e
-    `_hls_url` o stream do vídeo, que o dispatcher entrega pro yt-dlp."""
-    m = _POST_RE.search(page)
-    if not m:
-        raise ValueError("shreddit-post não encontrado na página do Reddit")
-    attrs = {k: html.unescape(v) for k, v in _ATTR_RE.findall(m.group(1))}
-    body = m.group(2)
-    post_type = attrs.get('post-type', '')
-    data = {
-        'title': attrs.get('post-title', ''),
-        'selftext': '',
-        'url': attrs.get('content-href', ''),
-        'domain': attrs.get('domain', ''),
-        'is_self': post_type == 'text',
-        'is_video': post_type == 'video',
-    }
-    player = _PLAYER_RE.search(body)
-    if player:
-        data['_hls_url'] = html.unescape(player.group(1))
-    if post_type in ('image', 'gallery'):
-        urls = [u for u in _IREDDIT_RE.findall(body) if is_reddit_media_url(u)]
-        data['_media_urls'] = list(dict.fromkeys(urls)) or [data['url']]
-    return data
-
-
-async def resolve_reddit_external_link(url: str) -> tuple["dict | None", "dict | None"]:
-    """Retorna (link, post_data). `link` é o dict do link externo (ou None se o
-    post for mídia nativa/texto); `post_data` é reaproveitado por
-    download_reddit_json pra não buscar o JSON duas vezes."""
-    try:
-        post_data = await _fetch_reddit_post_data(url)
-    except Exception as e:
-        logger.debug(lmsg("reddit_json.erro_ao_ler", e=e))
-        return None, None
-    return reddit_external_link(post_data), post_data
-
-
-async def download_reddit_json(
-    url: str, unique_folder: str, post_data: "dict | None" = None,
-) -> tuple[list[str], str, str, str]:
-    logger.info(lmsg("reddit_json.iniciando_extra_o_via", arg0=safe_url(url)))
-    if not os.path.exists(unique_folder):
-        os.makedirs(unique_folder)
-
-    media_urls = []
-    downloaded_files = []
-    title = ""
-    selftext = ""
-
-    try:
-        if post_data is None:
-            post_data = await _fetch_reddit_post_data(url)
+        post_data = data[0]['data']['children'][0]['data']
+        if post_data.get('removed_by_category'):
+            logger.info("Reddit confirmou conteúdo removido ou indisponível: %s", safe_url(url))
+            return [], REDDIT_UNAVAILABLE, "", ""
         title = post_data.get('title', '') or ''
         selftext = post_data.get('selftext', '') or ''
 
-        media_src = post_data
-        crosspost_parents = post_data.get('crosspost_parent_list') or []
-        if crosspost_parents:
-            media_src = crosspost_parents[-1]
-            logger.info(lmsg("reddit_json.crosspost_detectado"))
-            if not selftext:
-                selftext = media_src.get('selftext', '') or ''
-
-        if media_src.get('is_video') or media_src.get('post_hint') in ('hosted:video', 'rich:video'):
+        if _is_reddit_video_post(post_data):
             logger.info(lmsg("reddit_json.post_v_deo"))
-            return [], msg("downloader_status.reddit_json_fail"), "", ""
+            return [], REDDIT_JSON_VIDEO, "", ""
 
-        if media_src.get('_media_urls'):
-            media_urls = [u for u in map(clean_reddit_media_url, media_src['_media_urls']) if u]
-
-        elif 'media_metadata' in media_src:
-            metadata = media_src['media_metadata']
-            gallery_items = media_src.get('gallery_data', {}).get('items', [])
+        if 'media_metadata' in post_data:
+            gallery_items = post_data.get('gallery_data', {}).get('items', [])
             if gallery_items:
-                infos = [metadata.get(item['media_id'], {}) for item in gallery_items]
+                for item in gallery_items:
+                    media_id = item['media_id']
+                    media_info = post_data['media_metadata'].get(media_id, {})
+                    if media_info.get('status') == 'valid':
+                        img_url = media_info.get('s', {}).get('u') or media_info.get('s', {}).get('gif')
+                        clean_u = clean_reddit_media_url(img_url)
+                        if clean_u and clean_u not in media_urls: media_urls.append(clean_u)
             else:
-                infos = list(metadata.values())
-            for media_info in infos:
-                if media_info.get('status') != 'valid':
-                    continue
-                src = media_info.get('s', {})
-                clean_u = clean_reddit_media_url(src.get('u') or src.get('gif'))
-                if clean_u and clean_u not in media_urls:
-                    media_urls.append(clean_u)
+                for media_id, media_info in post_data['media_metadata'].items():
+                    if media_info.get('status') == 'valid':
+                        img_url = media_info.get('s', {}).get('u') or media_info.get('s', {}).get('gif')
+                        clean_u = clean_reddit_media_url(img_url)
+                        if clean_u and clean_u not in media_urls: media_urls.append(clean_u)
 
-        elif 'url' in media_src and looks_like_image(media_src['url']):
-            clean_u = clean_reddit_media_url(media_src['url'])
+        elif 'url' in post_data and looks_like_image(post_data['url']):
+            clean_u = clean_reddit_media_url(post_data['url'])
             if clean_u and clean_u not in media_urls: media_urls.append(clean_u)
 
-        elif 'preview' in media_src and 'images' in media_src['preview']:
-            img_url = media_src['preview']['images'][0]['source']['url']
+        elif 'preview' in post_data and 'images' in post_data['preview']:
+            img_url = post_data['preview']['images'][0]['source']['url']
             clean_u = clean_reddit_media_url(img_url)
             if clean_u and clean_u not in media_urls: media_urls.append(clean_u)
 
+    except ClientResponseError as e:
+        if e.status == 403:
+            logger.warning(
+                "⚠️ Reddit bloqueou a API JSON com HTTP 403; o próximo extrator será tentado: %s",
+                safe_url(url),
+            )
+        else:
+            logger.error(lmsg("reddit_json.erro_ao_ler", e=e), exc_info=True)
     except Exception as e:
         logger.error(lmsg("reddit_json.erro_ao_ler", e=e), exc_info=True)
 

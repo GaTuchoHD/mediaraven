@@ -2,9 +2,8 @@ import asyncio
 import logging
 import os
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
-import yt_dlp
 from curl_cffi import requests as curl_requests
 
 import state
@@ -17,10 +16,9 @@ from utils import (
     normalize_image,
     safe_url,
 )
+from url_safety import UnsafeURLError, validate_url_sync, validated_redirect
 
 from ._caption import _build_caption
-from ._platform import _bare_host, _host_matches
-from ._ytdlp import _build_format_selector, _list_downloaded_files
 from ._scrape_helpers import (
     MediaTuple,
     classify_media_url,
@@ -38,6 +36,7 @@ from ._scrape_helpers import (
 logger = logging.getLogger(__name__)
 
 
+_FACEBOOK_HOSTS = ('facebook.com', 'fb.com', 'fb.watch')
 _PINTEREST_HOSTS = ('pinterest.com', 'pin.it', 'pinterest.co.uk')
 _PAYWALL_PATTERNS = (
     'sign in to continue', 'log in to continue', 'subscribe to read',
@@ -46,8 +45,24 @@ _PAYWALL_PATTERNS = (
 )
 
 
+def _is_facebook(url: str) -> bool:
+    try:
+        host = (urlparse(url).netloc or '').lower()
+    except Exception:
+        return False
+    if host.startswith('www.'):
+        host = host[4:]
+    return any(host == h or host.endswith('.' + h) for h in _FACEBOOK_HOSTS)
+
+
 def _is_pinterest(url: str) -> bool:
-    return _host_matches(_bare_host(url), _PINTEREST_HOSTS)
+    try:
+        host = (urlparse(url).netloc or '').lower()
+    except Exception:
+        return False
+    if host.startswith('www.'):
+        host = host[4:]
+    return any(host == h or host.endswith('.' + h) for h in _PINTEREST_HOSTS)
 
 
 _GOOGLEBOT_UA = (
@@ -62,13 +77,25 @@ async def _fetch_html(
 ) -> Optional[str]:
     loop = asyncio.get_running_loop()
     headers = {'User-Agent': user_agent} if user_agent else None
+    def _request():
+        current = validate_url_sync(url)
+        for _ in range(6):
+            response = curl_requests.get(
+                current, impersonate="chrome", timeout=timeout,
+                allow_redirects=False, headers=headers,
+            )
+            if response.status_code not in {301, 302, 303, 307, 308}:
+                return response
+            location = response.headers.get("location")
+            if not location:
+                return response
+            current = validated_redirect(current, location)
+        raise UnsafeURLError("redirecionamentos em excesso")
+
     try:
         r = await loop.run_in_executor(
             state.IO_POOL,
-            lambda: curl_requests.get(
-                url, impersonate="chrome", timeout=timeout,
-                allow_redirects=True, headers=headers,
-            ),
+            _request,
         )
     except Exception as e:
         logger.debug(lmsg("fallback.curl_cffi_falhou", arg0=safe_url(url), e=e))
@@ -125,6 +152,8 @@ def _normalize_kind(kind: str, url: str) -> str:
 
 async def _gather_media_via_playwright(
     page_url: str,
+    *,
+    wait_for_video_ms: int = 0,
 ) -> tuple[list[MediaTuple], list[str], str]:
     """Scrape via Playwright. Retorna (media_tuples, iframe_urls, page_text)."""
     if not state.PW_BROWSER or not state.PW_CONTEXT:
@@ -151,6 +180,29 @@ async def _gather_media_via_playwright(
 
             page.on("response", handle_response)
             await page.goto(page_url, wait_until="load", timeout=cfg("PW_GOTO_TIMEOUT_MS"))
+
+            if wait_for_video_ms > 0:
+                # Some Cloudflare interstitials finish their browser check only
+                # after the initial ``load`` event.  Keep this opt-in so normal
+                # scraper calls are not delayed, and stop as soon as the real
+                # page exposes a video manifest or direct asset.
+                deadline = asyncio.get_running_loop().time() + (wait_for_video_ms / 1000)
+                while True:
+                    try:
+                        candidate_html = await page.content()
+                        candidate_media = extract_meta_media(candidate_html, page_url)
+                        if any(kind in ("video", "hls", "dash") for kind, _ in candidate_media):
+                            page_html = candidate_html
+                            break
+                    except Exception as e:
+                        logger.debug("Playwright ainda navegando durante espera de mídia: %s", e)
+
+                    remaining_ms = int(
+                        (deadline - asyncio.get_running_loop().time()) * 1000
+                    )
+                    if remaining_ms <= 0:
+                        break
+                    await page.wait_for_timeout(min(500, remaining_ms))
 
             prev_count = -1
             for _ in range(cfg("SCRAPE_SCROLL_MAX_ROUNDS")):
@@ -302,6 +354,8 @@ async def _download_all(
 
 async def _ytdlp_generic(url: str, folder: str) -> list[str]:
     """yt-dlp em modo genérico forçado. Cobre iframe/JSON-LD/HLS de saída."""
+    import yt_dlp
+
     opts = {
         'outtmpl': os.path.join(folder, 'generic_%(autonumber)s.%(ext)s'),
         'restrictfilenames': True,
@@ -311,9 +365,10 @@ async def _ytdlp_generic(url: str, folder: str) -> list[str]:
         'noplaylist': True,
         'force_generic_extractor': True,
         'socket_timeout': cfg("YTDLP_SOCKET_TIMEOUT"),
-        'format': _build_format_selector(
-            cfg("YTDLP_MAX_HEIGHT"), cfg("TELEGRAM_MAX_UPLOAD_MB"), "",
-            target_lang=None, youtube=False,
+        'format': (
+            f'bestvideo[height<={cfg("YTDLP_MAX_HEIGHT")}][filesize_approx<{max(50, cfg("TELEGRAM_MAX_UPLOAD_MB") - 100)}M]+bestaudio/'
+            f'best[height<={cfg("YTDLP_MAX_HEIGHT")}][filesize_approx<{cfg("TELEGRAM_MAX_UPLOAD_MB")}M]/'
+            f'best[filesize_approx<{cfg("TELEGRAM_MAX_UPLOAD_MB")}M]/best'
         ),
         'merge_output_format': 'mp4',
     }
@@ -333,7 +388,14 @@ async def _ytdlp_generic(url: str, folder: str) -> list[str]:
         logger.debug(lmsg("fallback.yt_dlp_generic_2", e=e))
         return []
 
-    return sorted(_list_downloaded_files(folder))
+    if not os.path.exists(folder):
+        return []
+    return sorted(
+        os.path.join(folder, f)
+        for f in os.listdir(folder)
+        if os.path.isfile(os.path.join(folder, f))
+        and not f.endswith(('.part', '.ytdl', '.temp'))
+    )
 
 
 _GALLERY_DL_LOCK = asyncio.Lock()
@@ -452,7 +514,9 @@ async def take_page_screenshot(folder: str, url: str) -> Optional[str]:
     return None
 
 
-def _build_status(files: list[str], status_key: str) -> str:
+def _build_status(
+    files: list[str], status_key: str, count_override: Optional[int] = None,
+) -> str:
     has_video = any(f.endswith('.mp4') for f in files)
     if has_video and len(files) > 1:
         label = msg("media_type_labels.scraper_video_mixed")
@@ -460,7 +524,7 @@ def _build_status(files: list[str], status_key: str) -> str:
         label = msg("media_type_labels.scraper_video")
     else:
         label = msg("media_type_labels.scraper_images")
-    return msg(status_key, media_type=label, count=len(files))
+    return msg(status_key, media_type=label, count=count_override or len(files))
 
 
 async def fetch_article_caption(url: str, html: Optional[str] = None) -> tuple[str, str]:

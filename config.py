@@ -7,6 +7,8 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
+from log_privacy import PrivacyFilter, PrivacyFormatter
+
 load_dotenv()
 
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -33,25 +35,30 @@ def _csv_strings(raw: str) -> list[str]:
     return [p.strip() for p in raw.split(",") if p.strip()]
 
 
-def _env_num(name: str, default, cast):
+def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name, "")
     if not raw:
         return default
     try:
-        return cast(raw)
+        return int(raw)
     except ValueError:
         _boot_logger.warning(
-            f"⚠️ Env var {name}={raw!r} não é {cast.__name__}; usando default {default}."
+            f"⚠️ Env var {name}={raw!r} não é inteiro; usando default {default}."
         )
         return default
 
 
-def _env_int(name: str, default: int) -> int:
-    return _env_num(name, default, int)
-
-
 def _env_float(name: str, default: float) -> float:
-    return _env_num(name, default, float)
+    raw = os.getenv(name, "")
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        _boot_logger.warning(
+            f"⚠️ Env var {name}={raw!r} não é float; usando default {default}."
+        )
+        return default
 
 
 def _env_str(name: str, default: str) -> str:
@@ -68,6 +75,11 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 ALLOWED_CHAT_ID: list[int] = _csv_ints(os.getenv("ALLOWED_CHAT_ID", ""), "ALLOWED_CHAT_ID")
 ALLOWED_USER_ID: list[int] = _csv_ints(os.getenv("ALLOWED_USER_IDS", ""), "ALLOWED_USER_IDS")
+ALLOWED_USERNAMES: frozenset[str] = frozenset(
+    username.lstrip("@").casefold()
+    for username in _csv_strings(os.getenv("ALLOWED_USERNAMES", ""))
+    if username.lstrip("@")
+)
 ALLOW_ALL = _env_yesno("ALLOW_ALL", "no")
 
 LOCAL_API_HOST = os.getenv("LOCAL_API_HOST", "")
@@ -75,7 +87,12 @@ LOCAL_API_URL = f"http://{LOCAL_API_HOST}/bot"
 LOCAL_FILE_URL = f"http://{LOCAL_API_HOST}/file/bot"
 
 BASE_DOWNLOAD_DIR = os.getenv("BASE_DOWNLOAD_DIR", "")
-FIREFOX_PROFILE_PATH = os.getenv("FIREFOX_PROFILE_PATH", "")
+IG_SESSION_FILE = os.getenv("IG_SESSION_FILE", "ig_session.json")
+# A managed profile path lets the server-side cookie installer work without a
+# desktop Firefox profile. An explicit FIREFOX_PROFILE_PATH still wins.
+FIREFOX_PROFILE_PATH = os.getenv("FIREFOX_PROFILE_PATH", "") or os.path.join(
+    _BASE_DIR, "cookies", "firefox"
+)
 
 _IMAGE_EXTS_DEFAULT = ('.jpg', '.jpeg', '.png', '.webp', '.heic', '.bmp', '.tiff', '.jfif', '.avif', '.ico', '.svg')
 _VIDEO_EXTS_DEFAULT = ('.mp4', '.mkv', '.webm', '.avi', '.mov', '.flv', '.m4v')
@@ -102,7 +119,7 @@ ASK_SCREENSHOT_TIMEOUT = _env_float("ASK_SCREENSHOT_TIMEOUT", 5.0)
 ASK_DL_DEFAULT = _env_yesno("ASK_DL_DEFAULT", "yes")
 ASK_CAPTION_DEFAULT = _env_yesno("ASK_CAPTION_DEFAULT", "no")
 ASK_ARTICLE_DEFAULT = _env_yesno("ASK_ARTICLE_DEFAULT", "yes")
-ASK_SCREENSHOT_DEFAULT = _env_yesno("ASK_SCREENSHOT_DEFAULT", "yes")
+ASK_SCREENSHOT_DEFAULT = _env_yesno("ASK_SCREENSHOT_DEFAULT", "no")
 
 PROMPT_DOWNLOAD_ENABLED = True
 PROMPT_CAPTION_ENABLED = True
@@ -116,14 +133,15 @@ def should_show_prompt(kind: str, chat_id: Optional[int] = None, user_id: Option
 YTDLP_MAX_HEIGHT = _env_int("YTDLP_MAX_HEIGHT", 1920)
 YTDLP_HLS_MAX_HEIGHT = _env_int("YTDLP_HLS_MAX_HEIGHT", 720)
 YTDLP_SOCKET_TIMEOUT = _env_int("YTDLP_SOCKET_TIMEOUT", 90)
-YTDLP_YT_CLIENTS = _env_str("YTDLP_YT_CLIENTS", "default")
-TIKTOK_PROXY = _env_str("TIKTOK_PROXY", "")
+YTDLP_YT_CLIENTS = _env_str("YTDLP_YT_CLIENTS", "ios,web,mweb,web_safari")
 YTDLP_WORKERS = _env_int("YTDLP_WORKERS", 5)
+BGUTIL_PORT = _env_int("BGUTIL_PORT", 4416)
 IG_WORKERS = _env_int("IG_WORKERS", 1)
 IO_WORKERS = _env_int("IO_WORKERS", 4)
 PW_CONCURRENCY = _env_int("PW_CONCURRENCY", 3)
 
 MAX_URLS_PER_MESSAGE = _env_int("MAX_URLS_PER_MESSAGE", 20)
+MAX_CONCURRENT_REQUESTS = max(1, _env_int("MAX_CONCURRENT_REQUESTS", 4))
 IGNORED_DOMAINS: list[str] = _csv_strings(os.getenv("IGNORED_DOMAINS", ""))
 DOWNLOAD_TIMEOUT_SECONDS = _env_int("DOWNLOAD_TIMEOUT_SECONDS", 15)
 SAFE_URL_MAX_LENGTH = _env_int("SAFE_URL_MAX_LENGTH", 200)
@@ -150,7 +168,7 @@ SCRAPE_SCROLL_PAUSE_MS = _env_int("SCRAPE_SCROLL_PAUSE_MS", 3000)
 SCRAPE_MIN_IMAGE_SIZE = _env_int("SCRAPE_MIN_IMAGE_SIZE", 50)
 SCRAPE_HLS_TIMEOUT_S = _env_int("SCRAPE_HLS_TIMEOUT_S", 180)
 SCRAPE_FAST_PATH_TIMEOUT_S = _env_int("SCRAPE_FAST_PATH_TIMEOUT_S", 12)
-SCRAPE_SCREENSHOT_FALLBACK = _env_yesno("SCRAPE_SCREENSHOT_FALLBACK", "yes")
+SCRAPE_SCREENSHOT_FALLBACK = _env_yesno("SCRAPE_SCREENSHOT_FALLBACK", "no")
 SCRAPE_GALLERY_DL_ENABLE = _env_yesno("SCRAPE_GALLERY_DL_ENABLE", "yes")
 SCRAPE_GALLERY_DL_TIMEOUT_S = _env_int("SCRAPE_GALLERY_DL_TIMEOUT_S", 90)
 SCRAPE_PAYWALL_BYPASS = _env_yesno("SCRAPE_PAYWALL_BYPASS", "yes")
@@ -172,6 +190,7 @@ MEDIA_GROUP_CHUNK_SIZE = _env_int("MEDIA_GROUP_CHUNK_SIZE", 10)
 METRICS_LOG_INTERVAL_MIN = _env_int("METRICS_LOG_INTERVAL_MIN", 30)
 TTL_RETRIES_SECONDS = _env_int("TTL_RETRIES_SECONDS", 3600)
 TTL_FUTURES_SECONDS = _env_int("TTL_FUTURES_SECONDS", 300)
+MEDIA_CACHE_ENABLED = _env_yesno("MEDIA_CACHE_ENABLED", "no") == "yes"
 
 SHUTDOWN_TASKS_TIMEOUT = _env_float("SHUTDOWN_TASKS_TIMEOUT", 30.0)
 
@@ -193,7 +212,8 @@ REDDIT_JSON_UA = _env_str(
 _NOISY_LIBS = (
     'httpx', 'httpcore', 'urllib3', 'asyncio', 'PIL',
     'gallery_dl', 'telegram._utils', 'telegram.ext._updater',
-    'apscheduler', 'curl_cffi', 'playwright',
+    'apscheduler', 'instagrapi.mixins', 'public_request',
+    'private_request', 'curl_cffi', 'playwright',
     'trafilatura', 'htmldate', 'courlan', 'charset_normalizer',
 )
 
@@ -203,7 +223,7 @@ def setup_logging() -> None:
     if root.handlers:
         return
     level = getattr(logging, LOG_LEVEL, logging.INFO)
-    formatter = logging.Formatter(
+    formatter = PrivacyFormatter(
         '%(asctime)s - %(levelname)s - %(name)s:%(lineno)d - %(message)s'
     )
     file_handler = RotatingFileHandler(
@@ -213,8 +233,10 @@ def setup_logging() -> None:
         encoding='utf-8',
     )
     file_handler.setFormatter(formatter)
+    file_handler.addFilter(PrivacyFilter())
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
+    stream_handler.addFilter(PrivacyFilter())
     root.setLevel(level)
     root.addHandler(file_handler)
     root.addHandler(stream_handler)
