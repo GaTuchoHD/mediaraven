@@ -38,3 +38,11 @@ components must retain their own configuration.
 ## Validation
 
 See `VALIDATION.md` for the commands and verified scope of this snapshot.
+
+## Audit follow-up
+
+The 2026-10-22 export initially carried version 1.2.17. The security and
+stability hardening branch advances it to 1.2.18 and adds a rootless Docker
+build. The latest verified Ubuntu CI result is documented in VALIDATION.md.
+The original Windows snapshot result remains historical; Windows has not
+been revalidated after these changes.
